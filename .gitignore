@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 环境变量（含密钥，不要上传）
+.env
+
+# 向量库本地数据
+vector_db/
+
+# IDE
+.vscode/
+.idea/
+
+# 虚拟环境
+venv/
+.venv/
+
+# 测试脚本
+test_*.py
