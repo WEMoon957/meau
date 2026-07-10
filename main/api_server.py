@@ -73,7 +73,7 @@ def get_session_manager() -> SessionManager:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     global _session_manager, _cleanup_task, _limiter_cleanup_task
 
     _session_manager = SessionManager(_create_agent)

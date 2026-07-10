@@ -7,7 +7,7 @@ from contextvars import ContextVar
 
 from langchain_core.tools import tool
 
-from menu_data import Dish, find_dish_by_name, format_dish_info, get_all_dishes
+from menu_data import Dish, find_dish_by_name, get_all_dishes
 
 
 # ======================== 购物车 ========================
@@ -133,16 +133,26 @@ def _dish_score(d: Dish, weather_set: set[int], season_set: set[int]) -> int:
     return score
 
 
-def _recommend_count_for_people(people_count: int) -> int:
+def _category_quota(people_count: int) -> dict[str, int]:
+    """根据人数返回各分类的推荐数量配额（与系统提示词策略一致）
+
+    一人食：1热菜+1主食+1汤/饮品 = 3道
+    2人食：1凉菜+2热菜+1主食+1汤 = 5道
+    3-4人：2凉菜+3热菜+1汤+1主食+1饮品 = 8道
+    5-8人：2凉菜+5热菜+1汤+2主食+1饮品+1甜点 = 12道
+    8人以上：3凉菜+6热菜+2汤+2主食+2饮品+1甜点 = 16道
+    """
     if people_count <= 0:
-        return 5
+        return {"凉菜": 1, "热菜": 3, "汤品": 1, "主食": 1, "饮品": 1}
+    if people_count <= 1:
+        return {"热菜": 1, "主食": 1, "汤品": 1}
     if people_count <= 2:
-        return 5
+        return {"凉菜": 1, "热菜": 2, "主食": 1, "汤品": 1}
     if people_count <= 4:
-        return 8
+        return {"凉菜": 2, "热菜": 3, "汤品": 1, "主食": 1, "饮品": 1}
     if people_count <= 8:
-        return 12
-    return 15
+        return {"凉菜": 2, "热菜": 5, "汤品": 1, "主食": 2, "饮品": 1, "甜点": 1}
+    return {"凉菜": 3, "热菜": 6, "汤品": 2, "主食": 2, "饮品": 2, "甜点": 1}
 
 
 # ======================== LangChain 工具定义 ========================
@@ -151,40 +161,26 @@ def _recommend_count_for_people(people_count: int) -> int:
 def query_dish(dish_name: str) -> str:
     """查询菜品详细信息，包括价格、辣度、适合人群、过敏原、饮食标签等。当顾客询问某道菜的具体信息时使用。
 
+    使用 Text-to-SQL 技术：LLM 根据菜品名称生成 SQL 查询数据库，精确匹配优先，模糊匹配兜底。
+
     Args:
         dish_name: 菜品名称，如：宫保鸡丁、水煮鱼
     """
-    dish = find_dish_by_name(dish_name)
-    if not dish:
-        return f"未找到菜品「{dish_name}」，请确认菜品名称。当前菜单共有 {len(get_all_dishes())} 道菜。"
-    return format_dish_info(dish)
+    from text_to_sql import query_dish_by_name
+    return query_dish_by_name(dish_name)
 
 
 @tool
 def list_menu(category: str = "") -> str:
     """列出菜单菜品，可按分类筛选。当顾客想看菜单或浏览某类菜品时使用。
 
+    使用 Text-to-SQL 技术：LLM 根据分类生成 SQL 查询数据库。
+
     Args:
         category: 菜品分类：凉菜/热菜/汤品/主食/饮品/甜点，为空则列出全部
     """
-    all_dishes = get_all_dishes()
-    if category:
-        dishes = [d for d in all_dishes if d.category == category]
-        if not dishes:
-            return f"没有找到分类「{category}」的菜品，可选分类：凉菜/热菜/汤品/主食/饮品/甜点"
-    else:
-        dishes = all_dishes
-
-    lines = [f"{'分类: ' + category if category else '全部'}菜单（共{len(dishes)}道）:\n"]
-    current_cat = ""
-    for d in dishes:
-        if d.category != current_cat:
-            current_cat = d.category
-            lines.append(f"\n--- {current_cat} ---")
-        sig = " ★" if d.is_signature else ""
-        spicy = f" [{d.spicy_level}]" if d.spicy_level != "不辣" else ""
-        lines.append(f"  {d.name}  ￥{d.price}{spicy}{sig}")
-    return "\n".join(lines)
+    from text_to_sql import list_menu_dishes
+    return list_menu_dishes(category)
 
 
 @tool
@@ -237,60 +233,39 @@ def recommend_dishes(
     weather_set = {id(d) for d in candidates if weather and weather in d.weather_fit}
     season_set = {id(d) for d in candidates if season and season in d.seasonal}
 
-    recommend_count = _recommend_count_for_people(people_count)
-
     def sort_key(d: Dish) -> int:
         return -_dish_score(d, weather_set, season_set)
 
     candidates.sort(key=sort_key)
 
-    # 候选不足时从全菜单补充
-    recommended = candidates[:recommend_count]
-    if len(recommended) < recommend_count:
-        existing_names = {d.name for d in recommended}
-        supplement_pool = [
-            d for d in all_dishes
-            if d.name not in existing_names
-        ]
-        supplement_pool = _filter_by_allergens(supplement_pool, avoid_list)
-        supplement_pool.sort(key=sort_key)
-        for d in supplement_pool:
-            if len(recommended) >= recommend_count:
-                break
+    # 按分类配额选取菜品（严格按人数控制总量，不再追加）
+    quota = _category_quota(people_count)
+    # 根据用户偏好调整配额
+    if not include_drinks:
+        quota.pop("饮品", None)
+    if not include_staple:
+        quota.pop("主食", None)
+    if not include_soup:
+        quota.pop("汤品", None)
+
+    recommended: list[Dish] = []
+    used_names: set[str] = set()
+
+    for cat, count in quota.items():
+        # 优先从已筛选候选中选取
+        cat_candidates = [d for d in candidates if d.category == cat and d.name not in used_names]
+        for d in cat_candidates[:count]:
             recommended.append(d)
-
-    # 确保必选分类有菜品
-    if people_count > 0:
-        min_drinks = max(1, people_count // 5)
-        min_staple = max(1, people_count // 4)
-        min_soup = 1 if people_count >= 2 else 0
-    else:
-        min_drinks = 1
-        min_staple = 1
-        min_soup = 0
-
-    category_min = {}
-    if include_drinks:
-        category_min["饮品"] = min_drinks
-    if include_staple:
-        category_min["主食"] = min_staple
-    if include_soup:
-        category_min["汤品"] = min_soup
-
-    existing_names = {d.name for d in recommended}
-    for cat, min_num in category_min.items():
-        cat_in_recommended = [d for d in recommended if d.category == cat]
-        if len(cat_in_recommended) < min_num:
-            need = min_num - len(cat_in_recommended)
-            pool = [
-                d for d in all_dishes
-                if d.category == cat and d.name not in existing_names
-            ]
+            used_names.add(d.name)
+        # 候选不足时从全菜单补充（仍受过敏原限制）
+        if len([d for d in recommended if d.category == cat]) < count:
+            need = count - len([d for d in recommended if d.category == cat])
+            pool = [d for d in all_dishes if d.category == cat and d.name not in used_names]
             pool = _filter_by_allergens(pool, avoid_list)
             pool.sort(key=sort_key)
             for d in pool[:need]:
                 recommended.append(d)
-                existing_names.add(d.name)
+                used_names.add(d.name)
 
     # 按分类分组展示，带序号和合计
     categories_order = ["凉菜", "热菜", "汤品", "主食", "饮品", "甜点"]
@@ -395,7 +370,14 @@ def checkout() -> str:
 
 @tool
 def generate_server_script(scene: str, script_type: str = "") -> str:
-    """根据场景从话术向量库中检索并生成服务员话术。当服务员需要应对特定场景的话术指导时使用，如顾客带小孩、顾客嫌辣、推荐招牌菜等。
+    """根据场景从话术向量库中检索并生成服务员话术。必须在此类场景下使用本工具，禁止自行编造回答：
+    - 顾客嫌菜太辣/太咸/不好吃等客诉应对
+    - 顾客带小孩/老人来用餐的推荐
+    - 如何迎宾、如何推荐招牌菜、如何结账
+    - 顾客对某些食材过敏的提醒
+    - 菜品缺货怎么应对
+    - 顾客等太久怎么安抚
+    - 任何"怎么应对/怎么说/怎么推荐"的服务沟通问题
 
     Args:
         scene: 场景描述，如"顾客带小孩来用餐""顾客嫌菜太辣""推荐招牌菜""四个人聚餐怎么推荐"

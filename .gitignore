@@ -21,3 +21,7 @@ venv/
 
 # 测试脚本
 test_*.py
+
+# 调试日志
+debug.log
+*.log

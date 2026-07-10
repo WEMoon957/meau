@@ -255,7 +255,7 @@ def find_dish_by_name(name: str) -> Optional[Dish]:
     if not name:
         return None
 
-    dishes = get_all_dishes()
+    get_all_dishes()  # 刷新缓存并确保索引已构建
     index = _dish_name_index or {}
 
     if name in index:
