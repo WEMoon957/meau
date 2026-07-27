@@ -82,8 +82,9 @@ SQL: SELECT * FROM dishes WHERE name = '宫保鸡丁' OR name LIKE '%宫保鸡�
 """
 
 # 禁止的 SQL 关键词（不区分大小写）
+# 含 UNION/INTO/DUMPFILE：UNION 可跨表读取，INTO OUTFILE/DUMPFILE 可写文件
 _FORBIDDEN_KEYWORDS = re.compile(
-    r'\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|MERGE|REPLACE|CALL|LOAD|OUTFILE)\b',
+    r'\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|MERGE|REPLACE|CALL|LOAD|OUTFILE|DUMPFILE|UNION|INTO)\b',
     re.IGNORECASE,
 )
 
@@ -165,6 +166,14 @@ def validate_sql(sql: str) -> tuple[bool, str]:
     # 不允许注释
     if "--" in sql_stripped or "/*" in sql_stripped or "#" in sql_stripped:
         return False, "SQL 不允许包含注释"
+
+    # 仅允许查询 dishes 表，禁止通过子查询/JOIN/UNION 读取其他表
+    # （UNION 已被关键词拦截，此处兜底拦截 FROM/JOIN 引用的其他表）
+    referenced_tables = re.findall(r'\bFROM\s+([\w.]+)', sql_stripped, re.IGNORECASE)
+    referenced_tables += re.findall(r'\bJOIN\s+([\w.]+)', sql_stripped, re.IGNORECASE)
+    for t in referenced_tables:
+        if t.split('.')[-1].lower() != 'dishes':
+            return False, f"仅允许查询 dishes 表，禁止访问: {t}"
 
     return True, ""
 
