@@ -75,6 +75,7 @@ from rate_limiter import (
 )
 from session_manager import (
     SessionManager,
+    SessionBusyError,
     run_cleanup_loop,
     SESSION_TTL_SECONDS,
     MAX_SESSIONS,
@@ -385,6 +386,12 @@ async def ai_chat(request: ChatRequest, http_request: Request):
         }
     except HTTPException:
         raise
+    except SessionBusyError:
+        raise HTTPException(
+            status_code=429,
+            detail="上一条消息还在处理中，请稍后重试",
+            headers={"Retry-After": "3"},
+        )
     except AgentError as e:
         logger.warning("chat 上游模型异常 session_id=%s: %s", session_id, e)
         raise HTTPException(status_code=502, detail="模型服务暂时不可用，请稍后重试")
