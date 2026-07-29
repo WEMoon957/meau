@@ -9,8 +9,6 @@
   - Redis 故障时单条请求降级：抛出异常由 API 层返回 503，绝不回退到内存字典
     （否则多 worker 下会出现部分 worker 用内存、部分用 Redis，导致历史错乱）。
   - MAX_SESSIONS 作为 Redis 侧会话计数上限（粗略保护），由健康检查暴露。
-  - 每会话并发锁：同一 session_id 的并发请求串行化，防止 load-modify-save
-    竞态导致历史覆写丢失（多 tab / 双击 / 前端重试场景）。
 """
 
 import asyncio
@@ -225,7 +223,7 @@ class SessionManager:
             members = self.redis.smembers(_SESSION_INDEX_KEY)
             removed = 0
             for sid in members:
-                               if not self.redis.exists(self._key(sid)):
+                if not self.redis.exists(self._key(sid)):
                     self.redis.srem(_SESSION_INDEX_KEY, sid)
                     removed += 1
             return removed
