@@ -131,9 +131,11 @@ def load_sop_prices() -> dict[str, dict]:
         name = row[0].strip() if row[0] else ""
         if not name:
             continue
+        # gross_margin 是 DECIMAL(5,2)，范围 0.62~1.00；NULL 归一化为 0
+        gm = float(row[2]) if row[2] is not None else 0.0
         out[name] = {
             "price": row[1],
-            "gross_margin": row[2],
+            "gross_margin": gm,
             "total_cost": row[3],
         }
     c.close()
@@ -152,6 +154,7 @@ def ensure_dishes_table(conn):
             id            INT AUTO_INCREMENT PRIMARY KEY,
             name          VARCHAR(100)  NOT NULL COMMENT '菜品名称',
             price         DECIMAL(10,2) COMMENT '价格',
+            gross_margin  DECIMAL(5,2)  COMMENT '毛利率(0~1)',
             category      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '分类',
             spicy_level   VARCHAR(20)   NOT NULL DEFAULT '不辣' COMMENT '辣度',
             suitable_for  JSON          COMMENT '适合人群列表',
@@ -167,7 +170,7 @@ def ensure_dishes_table(conn):
     """)
     conn.commit()
     c.close()
-    print("✅ dishes 表已重建")
+    print("✅ dishes 表已重建（含 gross_margin 字段）")
 
 
 # ------------------------------------------------------------------
@@ -204,6 +207,7 @@ def main():
 
         dish_name = name
         price = sop.get("price")
+        gross_margin = sop.get("gross_margin", 0.0)
         category = kb.get("category", "")
         spicy_level = kb.get("spicy_level", "不辣")
         suitable_for = kb.get("suitable_for", [])
@@ -223,12 +227,13 @@ def main():
 
         cur.execute(
             """INSERT INTO dishes
-               (name, price, category, spicy_level, suitable_for,
+               (name, price, gross_margin, category, spicy_level, suitable_for,
                 dietary_tags, allergens, description)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 dish_name,
                 price,
+                gross_margin,
                 category,
                 spicy_level,
                 json.dumps(suitable_for, ensure_ascii=False),

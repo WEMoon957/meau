@@ -118,7 +118,7 @@ def _row_to_dish(row: dict) -> Dish:
     return Dish(
         id=row["id"],
         name=row["name"],
-        price=float(row["price"]),
+        price=float(row["price"]) if row["price"] is not None else 0.0,
         category=row["category"],
         spicy_level=row["spicy_level"],
         suitable_for=_parse_json(row.get("suitable_for")),
@@ -128,6 +128,7 @@ def _row_to_dish(row: dict) -> Dish:
         is_signature=bool(row["is_signature"]),
         seasonal=_parse_json(row.get("seasonal")),
         weather_fit=_parse_json(row.get("weather_fit")),
+        gross_margin=float(row["gross_margin"]) if row.get("gross_margin") is not None else 0.0,
     )
 
 

@@ -26,6 +26,7 @@ class Dish:
     is_signature: bool = False
     seasonal: list = field(default_factory=list)
     weather_fit: list = field(default_factory=list)
+    gross_margin: float = 0.0  # 毛利率 0~1，推荐评分权重占 20%
 
 
 # ======================== 初始菜品数据（用于首次初始化数据库） ========================

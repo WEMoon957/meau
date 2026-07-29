@@ -26,7 +26,11 @@ from db import get_connection, _row_to_dish
 # 只允许在 dishes 表上按预定义字段筛选，所有值通过参数化传入，
 # 不存在任何用户可控的 SQL 片段拼接。
 
-_ALLOWED_CATEGORIES = {"凉菜", "热菜", "汤品", "主食", "饮品", "甜点"}
+_ALLOWED_CATEGORIES = {
+    "菌彩特色", "进店必点", "经典推荐", "菌汤锅底",
+    "山珍菌宴", "云岭特色", "山茅野菜",
+    "普洱黄牛肉", "涮品", "甜饮品",
+}
 _ALLOWED_SPICY_LEVELS = {"不辣", "微辣", "中辣", "特辣"}
 
 
