@@ -2,9 +2,18 @@
 
 基于 LangChain 1.0 的 create_agent（返回LangGraph的CompiledStateGraph）构建工具调用Agent。
 实现闭环：用户提问 -> AI理解 -> 调用工具 -> 返回推荐结果
+
+并发模型说明（高并发改造后）：
+  - OrderingAgent 现为【无状态】：不持有会话历史，history 由调用方传入并负责持久化。
+  - 每个 worker 进程【共享一个】 OrderingAgent 实例（graph 编译较重，避免每请求重建），
+    由 SessionManager 持有。线程安全：graph.invoke 为只读调用。
+  - 会话历史外部化到 Redis（见 session_manager.py），多 worker 共享，杜绝会话串号。
+  - LLM 调用受 LLM_REQUEST_TIMEOUT 约束，超时即抛 APITimeoutError，由 API 层映射 503，
+    防止单个慢请求长期占用 worker 线程。
 """
 
 import logging
+import os
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
@@ -13,6 +22,11 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from tools import ALL_TOOLS
 
 logger = logging.getLogger("agent")
+
+
+# LLM 单次请求超时（秒）。超时抛 openai.APITimeoutError，由 API 层映射 503。
+# 取默认 30s：单轮对话含工具调用可能 2~3 次模型往返，留足余量。
+LLM_REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "30"))
 
 
 class AgentError(Exception):
@@ -87,7 +101,11 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 
 
 class OrderingAgent:
-    """基于 LangChain 1.0 的点餐智能体"""
+    """基于 LangChain 1.0 的无状态点餐智能体。
+
+    单个实例可在多线程中被并发调用（graph.invoke 只读、无内部可变状态）。
+    会话历史由调用方负责加载/持久化（见 SessionManager.chat）。
+    """
 
     MAX_HISTORY = 20
 
@@ -101,12 +119,15 @@ class OrderingAgent:
             "model": model,
             "api_key": api_key,
             "temperature": 0,
+            "timeout": LLM_REQUEST_TIMEOUT,        # 单次请求超时（含工具往返）
+            "max_retries": 1,                      # 限制内置重试，避免请求堆积（外层有信号量背压）
         }
         if base_url:
             llm_kwargs["base_url"] = base_url
 
         llm = ChatOpenAI(**llm_kwargs)
 
+        # graph 编译较重，每个 worker 进程只构建一次；invoke 为只读，可并发
         self.graph = create_agent(
             model=llm,
             tools=ALL_TOOLS,
@@ -114,15 +135,22 @@ class OrderingAgent:
             debug=False,
         )
 
-        self.history: list = []
+    def chat(self, user_input: str, history: list) -> tuple[str, list]:
+        """处理用户输入并返回回复（无状态）。
 
-    def chat(self, user_input: str) -> str:
-        """处理用户输入并返回回复。
+        Args:
+            user_input: 当前用户输入文本
+            history: 既往会话历史（HumanMessage/AIMessage 列表），由调用方提供
+
+        Returns:
+            (response_text, new_messages)：
+              - response_text: 本轮回复文本
+              - new_messages: 需追加到历史的 [HumanMessage, AIMessage]
 
         不再捕获所有异常并转为字符串——内部错误向上抛出，由 API 层统一映射
         HTTP 状态码，避免异常文本被当成正常回复返回（原先始终返回 HTTP 200）。
         """
-        messages = self.history + [HumanMessage(content=user_input)]
+        messages = list(history) + [HumanMessage(content=user_input)]
         result = self.graph.invoke({"messages": messages})
 
         messages_out = result.get("messages", [])
@@ -156,14 +184,4 @@ class OrderingAgent:
             elif len(response) < 20:
                 response = tool_result
 
-        self.history.append(HumanMessage(content=user_input))
-        self.history.append(AIMessage(content=response))
-
-        if len(self.history) > self.MAX_HISTORY:
-            self.history = self.history[-self.MAX_HISTORY:]
-
-        return response
-
-    def reset(self):
-        """重置对话历史"""
-        self.history.clear()
+        return response, [HumanMessage(content=user_input), AIMessage(content=response)]

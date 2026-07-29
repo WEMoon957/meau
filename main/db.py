@@ -1,10 +1,23 @@
-"""数据库连接模块 - MySQL连接管理与菜品数据CRUD（使用pymysql）"""
+"""数据库连接模块 - MySQL连接池管理与菜品数据CRUD（使用pymysql + DBUtils）
+
+并发模型说明：
+  - 全进程共享一个 PooledDB 连接池，避免每次查询新建/销毁 TCP+认证握手。
+  - 池大小由 DB_POOL_SIZE 控制，超出时阻塞等待（blocking=True）以防穿透。
+  - 连接在 finally 中 close() 实际是归还池，由 DBUtils 管理。
+  - gunicorn 多 worker 时，每个 worker 进程独立持有一个池（fork 后不可共享连接），
+    因此单 worker 池大小 × worker 数 即为 MySQL 侧总连接数，需与 MySQL
+    max_connections 协调（推荐 DB_POOL_SIZE × WORKERS <= max_connections × 0.8）。
+  - 所有 SELECT 注入 /*+ MAX_EXECUTION_TIME(5000) */ 优化器提示并带 LIMIT，
+    防止慢查询拖垮 worker（硬约束）。
+"""
 
 import os
 import json
 import pymysql
 from pymysql.cursors import DictCursor
 from typing import Optional
+
+from dbutils.pooled_db import PooledDB
 
 from menu_data import Dish
 
@@ -19,14 +32,61 @@ DB_CONFIG = {
     "charset": "utf8mb4",
 }
 
+# 连接池配置
+DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "20"))        # 池最大连接数（单 worker）
+DB_POOL_MIN_CACHED = int(os.environ.get("DB_POOL_MIN_CACHED", "2"))
+DB_POOL_MAX_CACHED = int(os.environ.get("DB_POOL_MAX_CACHED", "5"))
+DB_CONN_RECYCLE = int(os.environ.get("DB_CONN_RECYCLE", "1800"))  # 连接最大存活秒数（防 MySQL 8h 断连）
+
+# 查询超时（毫秒）——与项目硬约束一致
+DB_MAX_EXECUTION_MS = int(os.environ.get("DB_MAX_EXECUTION_MS", "5000"))
+
+# 全表扫描兜底行数
+DISH_LIMIT = int(os.environ.get("DB_DISH_LIMIT", "1000"))
+
+_pool: Optional[PooledDB] = None
+
+
+def _get_pool() -> PooledDB:
+    """懒加载连接池。
+
+    懒加载原因：gunicorn preload_app=True 时模块在 master 进程导入，
+    若此时建池会被 fork 的子进程共享连接（MySQL 协议不允许），故推迟到首次使用。
+    """
+    global _pool
+    if _pool is None:
+        _pool = PooledDB(
+            creator=pymysql,
+            maxconnections=DB_POOL_SIZE,
+            mincached=DB_POOL_MIN_CACHED,
+            maxcached=DB_POOL_MAX_CACHED,
+            maxshared=0,            # 不在多线程间共享同一连接（pymysql 非线程安全）
+            blocking=True,          # 池耗尽时阻塞等待，而非直接报错（背压）
+            ping=1,                 # 取连接时校验存活，自动剔除死连接
+            maxusage=DB_CONN_RECYCLE,
+            **DB_CONFIG,
+        )
+    return _pool
+
 
 def get_connection():
-    """获取一个数据库连接"""
-    return pymysql.connect(**DB_CONFIG)
+    """从池中获取一个连接（用完必须 close() 归还池）。"""
+    return _get_pool().connection()
+
+
+def close_pool() -> None:
+    """关闭并释放连接池（仅在进程退出时调用）。"""
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close()
+        except Exception:
+            pass
+        _pool = None
 
 
 def test_connection() -> bool:
-    """测试数据库连接是否正常"""
+    """测试数据库连接是否正常（使用池）。"""
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -41,13 +101,18 @@ def test_connection() -> bool:
 
 
 # ======================== 菜品CRUD ========================
+# 注意：所有 SELECT 均带 MAX_EXECUTION_TIME 优化器提示 + LIMIT（硬约束）
 
 def fetch_all_dishes() -> list[Dish]:
     """从数据库加载所有菜品"""
     conn = get_connection()
     try:
         cursor = conn.cursor(DictCursor)
-        cursor.execute("SELECT * FROM dishes ORDER BY category, id")
+        cursor.execute(
+            f"SELECT /*+ MAX_EXECUTION_TIME({DB_MAX_EXECUTION_MS}) */ * "
+            f"FROM dishes ORDER BY category, id LIMIT %s",
+            (DISH_LIMIT,),
+        )
         rows = cursor.fetchall()
         return [_row_to_dish(row) for row in rows]
     finally:
@@ -61,8 +126,10 @@ def fetch_dish_by_name(name: str) -> Optional[Dish]:
     try:
         cursor = conn.cursor(DictCursor)
         cursor.execute(
-            "SELECT * FROM dishes WHERE name = %s OR name LIKE %s OR %s LIKE CONCAT('%%', name, '%%')",
-            (name, f"%{name}%", name),
+            f"SELECT /*+ MAX_EXECUTION_TIME({DB_MAX_EXECUTION_MS}) */ * "
+            f"FROM dishes WHERE name = %s OR name LIKE %s OR %s LIKE CONCAT('%%', name, '%%') "
+            f"LIMIT %s",
+            (name, f"%{name}%", name, 5),
         )
         row = cursor.fetchone()
         if row:
@@ -78,7 +145,11 @@ def fetch_dishes_by_category(category: str) -> list[Dish]:
     conn = get_connection()
     try:
         cursor = conn.cursor(DictCursor)
-        cursor.execute("SELECT * FROM dishes WHERE category = %s ORDER BY id", (category,))
+        cursor.execute(
+            f"SELECT /*+ MAX_EXECUTION_TIME({DB_MAX_EXECUTION_MS}) */ * "
+            f"FROM dishes WHERE category = %s ORDER BY id LIMIT %s",
+            (category, DISH_LIMIT),
+        )
         rows = cursor.fetchall()
         return [_row_to_dish(row) for row in rows]
     finally:

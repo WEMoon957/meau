@@ -44,9 +44,19 @@ def _get_kb() -> VectorStore:
     return _kb_instance
 
 
+_client_instance: OpenAI | None = None
+
+
 def _get_client() -> OpenAI:
-    """获取 OpenAI 客户端（指向千问端点）"""
-    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    """获取 OpenAI 客户端单例（指向千问端点）。
+
+    单例化原因：每次调用创建新 OpenAI 客户端会重复建立连接池/httpx session，
+    在并发下造成句柄泄漏与 TLS 握手开销。客户端内部线程安全，可全局复用。
+    """
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    return _client_instance
 
 
 def _get_query_embedding(query_text: str) -> np.ndarray:

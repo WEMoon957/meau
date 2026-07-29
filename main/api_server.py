@@ -4,7 +4,14 @@
   POST /api/ai/chat  - 对话接口，返回AI回复
   POST /api/ai/reset - 重置对话
   GET  /api/ai/info  - 获取服务信息
-  GET  /api/health   - 健康检查
+  GET  /api/health   - 健康检查（含 DB/KB/Redis 探活）
+
+并发模型说明（高并发改造后）：
+  - 多 worker：通过 gunicorn + UvicornWorker 横向扩展（见 gunicorn_conf.py / deploy.sh）。
+  - 会话/限流：外部化到 Redis，多 worker 共享，杜绝会话串号与限流被 worker 数倍绕过。
+  - 共享无状态 Agent：每个 worker 持有一个 OrderingAgent，所有会话复用 graph（只读、可并发）。
+  - 背压：_chat_semaphore 限制单 worker 并发 LLM 调用，超限立即 503，避免请求堆积。
+  - 优雅关停：lifespan 关闭时关闭 DB 连接池与 Redis 连接，gunicorn graceful_timeout 配合 drain。
 """
 
 import asyncio
@@ -59,9 +66,9 @@ except ImportError:
 
 from agent import OrderingAgent, AgentError
 from menu_data import get_all_dishes
+import rate_limiter
 from rate_limiter import (
-    ip_chat_limiter,
-    session_chat_limiter,
+    init_limiters,
     CHAT_RATE_PER_IP,
     CHAT_RATE_PER_SESSION,
     CHAT_RATE_WINDOW,
@@ -73,16 +80,41 @@ from session_manager import (
     MAX_SESSIONS,
 )
 from kb_query import preload_kb
+import db as _db
 
 
 # ======================== 配置 ========================
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "qwen-turbo")
 MAX_CONCURRENT_CHATS = int(os.environ.get("MAX_CONCURRENT_CHATS", "20"))
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
 _chat_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHATS)
 _session_manager: SessionManager | None = None
 _cleanup_task: asyncio.Task | None = None
 _limiter_cleanup_task: asyncio.Task | None = None
+_redis_client = None
+
+
+def _create_redis_client():
+    """创建 Redis 客户端。未配置 REDIS_URL 时返回 None（回退单 worker 内存模式）。"""
+    if not REDIS_URL:
+        return None
+    try:
+        import redis
+        client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+            retry_on_timeout=True,
+            health_check_interval=30,
+        )
+        client.ping()
+        logger.info("Redis 已连接: %s", REDIS_URL)
+        return client
+    except Exception as e:
+        # Redis 是多 worker 的硬前提；连不上直接退出，避免以"伪多 worker"模式运行导致串号
+        raise RuntimeError(f"REDIS_URL 已配置但连接失败，拒绝以多 worker 模式启动: {e}") from e
 
 
 def _create_agent() -> OrderingAgent:
@@ -99,11 +131,20 @@ def get_session_manager() -> SessionManager:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _session_manager, _cleanup_task, _limiter_cleanup_task
+    global _session_manager, _cleanup_task, _limiter_cleanup_task, _redis_client
 
-    _session_manager = SessionManager(_create_agent)
+    # 1. Redis（多 worker 共享会话/限流的前提）
+    _redis_client = _create_redis_client()
+
+    # 2. 限流器（Redis 或内存）
+    init_limiters(_redis_client)
+
+    # 3. 共享无状态 Agent + 会话管理器
+    agent = _create_agent()
+    _session_manager = SessionManager(agent, redis_client=_redis_client)
+
+    # 4. 预热数据
     get_all_dishes()
-
     try:
         preload_kb()
     except Exception as e:
@@ -115,25 +156,41 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         print(f"⚠️ 菜品规则引擎预加载失败，推荐时将重试: {e}")
 
+    # 5. 后台清理任务
     _cleanup_task = asyncio.create_task(run_cleanup_loop(_session_manager))
     _limiter_cleanup_task = asyncio.create_task(_run_limiter_cleanup())
 
     yield
 
+    # 6. 优雅关停：取消后台任务 -> 清理会话索引 -> 关闭 DB 池/Redis
     if _cleanup_task:
         _cleanup_task.cancel()
     if _limiter_cleanup_task:
         _limiter_cleanup_task.cancel()
     if _session_manager:
-        _session_manager.clear()
+        try:
+            _session_manager.clear()
+        except Exception as e:
+            logger.warning("会话清理失败（忽略）: %s", e)
+    _db.close_pool()
+    if _redis_client is not None:
+        try:
+            _redis_client.close()
+        except Exception:
+            pass
 
 
 async def _run_limiter_cleanup():
-    """定期清理限流器过期 key，防止内存泄漏"""
+    """定期清理限流器过期 key，防止内存泄漏（Redis 模式下为 no-op）"""
     while True:
         await asyncio.sleep(600)
-        ip_chat_limiter.cleanup_stale()
-        session_chat_limiter.cleanup_stale()
+        try:
+            if rate_limiter.ip_chat_limiter is not None:
+                rate_limiter.ip_chat_limiter.cleanup_stale()
+            if rate_limiter.session_chat_limiter is not None:
+                rate_limiter.session_chat_limiter.cleanup_stale()
+        except Exception as e:
+            print(f"[limiter] 清理异常（忽略）: {e}")
 
 
 # ======================== FastAPI 应用 ========================
@@ -254,24 +311,48 @@ def _client_ip(request: Request) -> str:
 
 
 def _check_chat_rate_limit(request: Request, session_id: str) -> None:
-    """O(1) 限流检查，超限立即 429，不进入 LLM 调用"""
+    """O(1) 限流检查，超限立即 429，不进入 LLM 调用。
+
+    Redis 故障时抛 503（不静默放行，防 LLM 被打爆）。
+    """
     ip = _client_ip(request)
 
-    allowed, retry_after = session_chat_limiter.allow(session_id)
-    if not allowed:
+    # 通过模块属性访问：init_limiters() 在 lifespan 中重新赋值模块级实例，
+    # 按名导入会绑定到旧值（None），故这里走 rate_limiter.<name> 取最新实例。
+    ses_limiter = rate_limiter.session_chat_limiter
+    ip_limiter = rate_limiter.ip_chat_limiter
+    if ses_limiter is None or ip_limiter is None:
         raise HTTPException(
-            status_code=429,
-            detail=f"会话请求过于频繁，请 {retry_after} 秒后重试",
-            headers={"Retry-After": str(retry_after)},
+            status_code=503,
+            detail="限流服务尚未就绪，请稍后重试",
+            headers={"Retry-After": "5"},
         )
 
-    allowed, retry_after = ip_chat_limiter.allow(ip)
-    if not allowed:
+    try:
+        allowed, retry_after = ses_limiter.allow(session_id)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"会话请求过于频繁，请 {retry_after} 秒后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        allowed, retry_after = ip_limiter.allow(ip)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"IP 请求过于频繁，请 {retry_after} 秒后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("限流器检查异常（疑似 Redis 故障），拒绝请求以保护 LLM")
         raise HTTPException(
-            status_code=429,
-            detail=f"IP 请求过于频繁，请 {retry_after} 秒后重试",
-            headers={"Retry-After": str(retry_after)},
-        )
+            status_code=503,
+            detail="限流服务暂不可用，请稍后重试",
+            headers={"Retry-After": "5"},
+        ) from e
 
 
 # ======================== 接口 ========================
@@ -282,7 +363,6 @@ async def ai_chat(request: ChatRequest, http_request: Request):
     _check_chat_rate_limit(http_request, session_id)
 
     manager = get_session_manager()
-    agent = manager.get_agent(session_id)
 
     if _chat_semaphore.locked():
         raise HTTPException(
@@ -293,8 +373,10 @@ async def ai_chat(request: ChatRequest, http_request: Request):
 
     try:
         async with _chat_semaphore:
-            aimessage = await asyncio.to_thread(agent.chat, request.message.strip())
-        manager.touch(session_id)
+            # 无状态 agent + Redis 历史：在线程池中执行（graph.invoke 为同步阻塞调用）
+            aimessage = await asyncio.to_thread(
+                manager.chat, session_id, request.message.strip()
+            )
         return {
             "code": 200,
             "msg": "success",
@@ -322,19 +404,45 @@ async def ai_reset(request: ResetRequest):
     """重置对话，清空历史上下文"""
     session_id = _resolve_session_id(request.session_id, auto_create=False)
     manager = get_session_manager()
-    agent = manager.get_agent(session_id)
-    agent.reset()
-    manager.touch(session_id)
+    manager.reset(session_id)
     return {"code": 200, "msg": "success", "session_id": session_id}
 
 
 @app.get("/api/health")
 async def health_check():
-    """健康检查"""
+    """健康检查（含 DB/KB/Redis 探活，供负载均衡判断）"""
     manager = get_session_manager()
+
+    # DB 探活（池内取连接执行 SELECT 1）
+    db_ok = True
+    try:
+        _db.test_connection()
+    except Exception:
+        db_ok = False
+
+    # Redis 探活（未启用视为 ok 并标记未启用）
+    redis_ok = True
+    if _redis_client is not None:
+        try:
+            _redis_client.ping()
+        except Exception:
+            redis_ok = False
+
+    # KB 探活：仅检测单例是否加载，不在健康检查里触发向量检索（避免拖慢探活）
+    kb_ok = True
+    try:
+        from kb_query import _kb_instance  # noqa: F401
+        kb_ok = _kb_instance is not None
+    except Exception:
+        kb_ok = False
+
+    # 任一关键依赖不可用 -> 503，让 LB 摘流
+    degraded = not (db_ok and redis_ok)
+    status_code = 503 if degraded else 200
+
     return {
-        "code": 200,
-        "msg": "ok",
+        "code": status_code,
+        "msg": "ok" if not degraded else "degraded",
         "data": {
             "dish_count": len(get_all_dishes()),
             "active_sessions": manager.active_count,
@@ -345,6 +453,11 @@ async def health_check():
             "rate_limits": {
                 "per_session": f"{CHAT_RATE_PER_SESSION}/{CHAT_RATE_WINDOW}s",
                 "per_ip": f"{CHAT_RATE_PER_IP}/{CHAT_RATE_WINDOW}s",
+            },
+            "dependencies": {
+                "db": "ok" if db_ok else "fail",
+                "redis": "ok" if redis_ok else ("disabled" if _redis_client is None else "fail"),
+                "kb": "ok" if kb_ok else "unloaded",
             },
         },
     }
@@ -379,4 +492,5 @@ async def ai_info():
 
 if __name__ == "__main__":
     import uvicorn
+    # 本地开发：单 worker。生产部署请使用 gunicorn（见 gunicorn_conf.py / deploy.sh）
     uvicorn.run(app, host="0.0.0.0", port=3000)
