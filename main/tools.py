@@ -342,6 +342,7 @@ def recommend_dishes(
     include_drinks: bool = True,
     include_staple: bool = True,
     include_soup: bool = True,
+    exclude_dishes: str = "",
 ) -> str:
     """根据顾客需求智能推荐菜品。根据人数、口味、人群类型、健康标签、天气、季节、过敏原等多维度筛选并按综合评分排序推荐。评分包含毛利率权重（占 20%），优先推荐高毛利、招牌、应季菜品。当顾客表达用餐需求或请求推荐时使用。
 
@@ -356,10 +357,12 @@ def recommend_dishes(
         include_drinks: 是否包含饮品（甜饮品分类），默认True
         include_staple: 是否包含主食类菜品，默认True
         include_soup: 是否包含汤锅类（菌汤锅底分类），默认True
+        exclude_dishes: 需要排除的菜品名称（已推荐过的），多个用逗号分隔。用于追加推荐场景避免重复。锅底名称传入后仍会推荐（火锅店必选），但会尝试换一个锅底
     """
     all_dishes = get_all_dishes()
     candidates = list(all_dishes)
     avoid_list = _parse_csv(allergen_avoid)
+    exclude_set = {x.strip() for x in _parse_csv(exclude_dishes) if x.strip()}
 
     # 1. 口味筛选
     candidates = _filter_by_taste(candidates, taste)
@@ -378,11 +381,25 @@ def recommend_dishes(
     # 4. 过敏原排除
     candidates = _filter_by_allergens(candidates, avoid_list)
 
+    # 4.5 排除已推荐过的菜品（追加场景去重）
+    # 锅底不在此处排除（火锅店必选，单独处理换锅底逻辑）
+    if exclude_set:
+        candidates = [d for d in candidates
+                      if d.name not in exclude_set
+                      or (d.category == "菌汤锅底" and "锅" in d.name)]
+
     # 5. 品类开关过滤
     if not include_drinks:
         candidates = [d for d in candidates if d.category != "甜饮品"]
     if not include_soup:
-        candidates = [d for d in candidates if d.category != "菌汤锅底"]
+        # 火锅店锅底必选：include_soup=False 仅过滤非锅底的汤类菜品
+        # 菌汤锅底分类中名字含"锅"的为锅底（必选），其余为汤品（如山茅野菜拼盘，可过滤）
+        candidates = [d for d in candidates
+                      if d.category != "菌汤锅底" or "锅" in d.name]
+    # 无论 include_soup 是否为 False，candidates 中菌汤锅底分类仅保留真锅底
+    # （山茅野菜拼盘是涮菜拼盘，分类标注错误，不应出现在推荐候选中）
+    candidates = [d for d in candidates
+                  if d.category != "菌汤锅底" or "锅" in d.name]
     if not include_staple:
         # 主食类菜名关键词过滤（菌彩特色分类里包含主食）
         staple_keywords = ("饵丝", "饵块", "焖饭", "糯米粉", "米线", "面")
@@ -426,6 +443,35 @@ def recommend_dishes(
             used_names.add(d.name)
             cat_count[d.category] = cat_count.get(d.category, 0) + 1
 
+    # 火锅店必选锅底：至少 1 道菌汤锅底，不受口味/人群/健康标签筛选
+    # 仅受过敏原限制；优先选名字含"锅"的真锅底，计入总配额，排在推荐列表首位
+    # 蒜过敏兜底：若所有锅底均含过敏原，仍推荐唯一锅底并提示用户
+    # 追加去重：若已推荐过锅底且存在其他锅底，则换一个不同的锅底
+    pot_pool = _filter_by_allergens(
+        [d for d in all_dishes if d.category == "菌汤锅底" and "锅" in d.name],
+        avoid_list,
+    )
+    pot_warning = ""
+    if not pot_pool:
+        # 兜底：所有锅底均含过敏原，取唯一锅底并生成提示
+        all_pots = [d for d in all_dishes if d.category == "菌汤锅底" and "锅" in d.name]
+        if all_pots:
+            pot_pool = all_pots
+            pot_warning = f"⚠️ 提示：本店锅底「{all_pots[0].name}」含 {allergen_avoid or '过敏原'}，"
+            if avoid_list:
+                pot_warning += f"无法避开，请确认是否可接受；"
+    if pot_pool:
+        pot_pool.sort(key=lambda d: -_dish_score(d, weather_set, season_set))
+        # 追加场景：优先选未排除的锅底；若全部已排除（只有一个锅底），仍推荐唯一锅底
+        if exclude_set:
+            fresh_pots = [d for d in pot_pool if d.name not in exclude_set]
+            mandatory_pot = fresh_pots[0] if fresh_pots else pot_pool[0]
+        else:
+            mandatory_pot = pot_pool[0]
+        recommended.append(mandatory_pot)
+        used_names.add(mandatory_pot.name)
+        cat_count[mandatory_pot.category] = 1
+
     # 第一轮：从筛选后候选中选，同分类限 2 道
     _try_fill(candidates, enforce_cat_limit=True)
 
@@ -447,6 +493,8 @@ def recommend_dishes(
             cat_order.append(d.category)
 
     lines = ["为您推荐以下菜品：\n"]
+    if pot_warning:
+        lines.append(pot_warning + "\n")
 
     total_price = 0.0
     idx = 1
