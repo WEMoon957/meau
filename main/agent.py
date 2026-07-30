@@ -135,7 +135,11 @@ class OrderingAgent:
             "temperature": 0,
             "timeout": LLM_REQUEST_TIMEOUT,
             "max_retries": 1,
+            "max_tokens": 4096,
         }
+        # DeepSeek v3 模型禁用 thinking 模式（v4-flash 等新模型不支持此参数）
+        if "deepseek" in model.lower() and "v3" in model.lower():
+            llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if base_url:
             llm_kwargs["base_url"] = base_url
 
@@ -157,7 +161,9 @@ class OrderingAgent:
         messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(history) + [HumanMessage(content=user_input)]
 
         # 第 1 次 LLM 调用：决策
+        logger.debug("chat: user_input=%s history_len=%d model=%s", user_input[:50], len(history), self.llm.model_name)
         ai_msg = self.llm_with_tools.invoke(messages)
+        logger.debug("chat: tool_calls=%s content_preview=%s", bool(ai_msg.tool_calls), (ai_msg.content or "")[:80])
 
         # 无工具调用，直接返回 LLM 回复
         if not ai_msg.tool_calls:

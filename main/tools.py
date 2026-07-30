@@ -85,6 +85,55 @@ def _parse_kb_suitable_crowd(suitable_crowd: str) -> list[str]:
     return result
 
 
+def _parse_kb_dietary_tags(calorie: str, property_val: str) -> list[str]:
+    """解析向量库的 calorie 和 property 字段，映射为系统饮食标签
+
+    向量库字段：
+      - calorie: "低热量" / "极低热量" / "中热量" 等
+      - property: "素菜" / "荤菜" 等
+
+    映射规则（仅当 MySQL dietary_tags 为空时补全）：
+      - "低热量" / "极低热量" → "低脂"
+      - "素菜" / 含"素" → "素食"
+      - "荤菜" / 含"荤" → "高蛋白"
+
+    注意：系统合法标签为 素食/低脂/低糖/高蛋白/无麸质，不生成非法标签。
+    """
+    tags = []
+    if calorie and ("低热量" in calorie or "极低热量" in calorie):
+        tags.append("低脂")
+    if property_val:
+        if "素" in property_val:
+            tags.append("素食")
+        elif "荤" in property_val:
+            tags.append("高蛋白")
+    return tags
+
+
+def _build_kb_description(kb_meta: dict) -> str:
+    """从向量库元数据构建菜品描述文本
+
+    组合 property（荤素）、calorie（热量）、salt_level（咸度）、pairing（搭配建议）
+    生成简洁的描述文本，仅在 MySQL description 为空时使用。
+    """
+    parts = []
+    prop = kb_meta.get("property", "")
+    calorie = kb_meta.get("calorie", "")
+    salt_level = kb_meta.get("salt_level", "")
+    pairing = kb_meta.get("pairing", "")
+
+    if prop:
+        parts.append(prop)
+    if calorie:
+        parts.append(calorie)
+    if salt_level:
+        parts.append(salt_level)
+    if pairing:
+        parts.append(f"搭配建议：{pairing}")
+
+    return "；".join(parts) if parts else ""
+
+
 def _load_kb_profiles() -> dict:
     """从向量库加载所有 dish_profile，按菜名索引
 
@@ -112,9 +161,12 @@ def _merge_dish_with_kb(dish: Dish, kb_meta: dict) -> Dish:
     """用向量库字段补全 MySQL Dish 对象的空字段
 
     合并规则（向量库为权威源，仅在 MySQL 字段为空时补全）：
-    - spicy_level: MySQL 空 → 用向量库 spice_level
-    - allergens: MySQL 空 → 用向量库 allergen_info 解析结果
+    - spicy_level:  MySQL 空 → 用向量库 spice_level
+    - allergens:    MySQL 空 → 用向量库 allergen_info 解析结果
     - suitable_for: MySQL 空 → 用向量库 suitable_crowd 解析结果
+    - dietary_tags: MySQL 空 → 用向量库 calorie + property 推导
+    - description:  MySQL 空 → 用向量库 property/calorie/salt/pairing 拼接
+    - category:     MySQL 空 → 用向量库 category 补全
 
     返回新的 Dish 对象（深拷贝，不修改原对象）
     """
@@ -137,6 +189,31 @@ def _merge_dish_with_kb(dish: Dish, kb_meta: dict) -> Dish:
         kb_crowd = _parse_kb_suitable_crowd(kb_meta.get("suitable_crowd", ""))
         if kb_crowd:
             merged.suitable_for = kb_crowd
+
+    # 饮食标签补全：MySQL dietary_tags 可能包含迁移时产生的无效标签名
+    # （如 migrate_menu.py 写入的 "低热量"/"素菜"/"荤菜"），需做归一化处理
+    _VALID_TAGS = {"素食", "低脂", "低糖", "高蛋白", "无麸质"}
+    existing_valid = [t for t in merged.dietary_tags if t in _VALID_TAGS]
+    kb_tags = _parse_kb_dietary_tags(
+        kb_meta.get("calorie", ""),
+        kb_meta.get("property", ""),
+    )
+    # 策略：MySQL 有效标签 + KB 推导标签 取并集（去重）
+    merged_tags = list(set(existing_valid + kb_tags))
+    if merged_tags:
+        merged.dietary_tags = merged_tags
+
+    # 描述补全（从向量库元数据拼接）
+    if not merged.description or merged.description == "":
+        kb_desc = _build_kb_description(kb_meta)
+        if kb_desc:
+            merged.description = kb_desc
+
+    # 分类补全
+    if not merged.category or merged.category == "":
+        kb_cat = kb_meta.get("category", "")
+        if kb_cat:
+            merged.category = kb_cat
 
     return merged
 
@@ -437,6 +514,13 @@ _SPECIAL_DISH_KEYWORDS = {
     "儿童": {"儿童", "小孩"},
 }
 
+# 多人份菜品关键词 → 适用最低人数
+# 含"四人"的拼盘至少3人才能推荐，含"双人"的至少2人
+_PARTY_SIZE_KEYWORDS = {
+    "四人": 3,
+    "双人": 2,
+}
+
 
 def _filter_by_scene(candidates: list[Dish], customer_type: str) -> list[Dish]:
     """按场景过滤特殊菜品
@@ -458,6 +542,31 @@ def _filter_by_scene(candidates: list[Dish], customer_type: str) -> list[Dish]:
             if keyword in d.name:
                 # 菜名含特殊关键词，检查 customer_type 是否匹配
                 if ct not in allowed_tags:
+                    should_skip = True
+                    break
+        if not should_skip:
+            filtered.append(d)
+    return filtered
+
+
+def _filter_by_party_size(candidates: list[Dish], people_count: int) -> list[Dish]:
+    """按人数过滤多人份拼盘菜品
+
+    菜名含"四人/双人"等关键词的菜品，人数不足时排除：
+      - 含"四人"：至少 3 人才能推荐
+      - 含"双人"：至少 2 人才能推荐
+
+    避免给单人推荐四人拼盘这类不合理情况。
+    """
+    if not candidates or people_count <= 0:
+        return candidates
+
+    filtered = []
+    for d in candidates:
+        should_skip = False
+        for keyword, min_people in _PARTY_SIZE_KEYWORDS.items():
+            if keyword in d.name:
+                if people_count < min_people:
                     should_skip = True
                     break
         if not should_skip:
@@ -592,14 +701,33 @@ def recommend_dishes(
     
     # ========== 基础筛选 ==========
     
-    # 1. 口味筛选
+    # 1. 口味筛选（带渐进降级：特辣→中辣→微辣→不限）
+    original_taste = taste
     candidates = _filter_by_taste(candidates, taste)
+    if not candidates and taste in ("特辣", "中辣", "微辣"):
+        # 特辣无结果 → 降级到中辣及以上
+        relaxed = "中辣" if taste == "特辣" else "微辣"
+        candidates = [d for d in all_dishes if d.spicy_level in (taste, relaxed)]
+        if candidates:
+            taste = f"{taste}/{relaxed}"  # 标记实际使用的口味
+    if not candidates and taste in ("特辣/中辣", "中辣/微辣"):
+        # 仍无结果 → 降级到所有辣味
+        candidates = [d for d in all_dishes if d.spicy_level != "不辣"]
+        if candidates:
+            taste = "辣"
+    if not candidates:
+        # 完全无辣味菜品 → 取消口味限制
+        candidates = list(all_dishes)
+        taste = ""
     
     # 2. 人群筛选
     candidates = _filter_by_customer_type(candidates, customer_type)
     
-    # 3. 场景过滤
+    # 3. 场景过滤（儿童餐等）
     candidates = _filter_by_scene(candidates, customer_type)
+
+    # 3.5. 按人数过滤多人份拼盘（四人拼盘至少3人，双人拼盘至少2人）
+    candidates = _filter_by_party_size(candidates, people_count)
     
     # 4. 健康标签筛选
     if health_tags:
@@ -612,10 +740,6 @@ def recommend_dishes(
     # 6. 品类开关过滤
     if not include_drinks:
         candidates = [d for d in candidates if d.category != "甜饮品"]
-    
-    if not include_soup:
-        candidates = [d for d in candidates
-                      if d.category != "菌汤锅底" or "锅" in d.name]
     
     candidates = [d for d in candidates
                   if d.category != "菌汤锅底" or "锅" in d.name]
@@ -672,6 +796,8 @@ def recommend_dishes(
     category_weights = _calculate_category_weights(category_pools, customer_type, weather, season)
     
     # 多轮选择，确保分类均衡
+    # 规则引擎：跟踪被冲突规则跳过的菜品名称
+    skipped_by_rules = []
     for round_num in range(3):  # 最多3轮选择
         if len(recommended) >= total_quota:
             break
@@ -684,16 +810,46 @@ def recommend_dishes(
             # 第一轮：优先高权重分类，每个分类最多2个
             _select_by_category_weights(category_pools, category_weights, recommended,
                                      used_names, cat_count, max_per_category=2,
-                                     remaining_slots=remaining_slots, total_quota=total_quota)
+                                     remaining_slots=remaining_slots, total_quota=total_quota,
+                                     skipped_by_rules=skipped_by_rules)
         elif round_num == 1:
             # 第二轮：放宽分类限制，但保持多样性
             _select_by_category_weights(category_pools, category_weights, recommended,
                                      used_names, cat_count, max_per_category=3,
-                                     remaining_slots=remaining_slots, total_quota=total_quota)
+                                     remaining_slots=remaining_slots, total_quota=total_quota,
+                                     skipped_by_rules=skipped_by_rules)
         else:
             # 第三轮：从剩余菜品中随机选择
             _select_from_remaining(category_pools, recommended, used_names,
-                                 remaining_slots, total_quota)
+                                 remaining_slots, total_quota,
+                                 skipped_by_rules=skipped_by_rules)
+    
+    # ========== 饮品保障 ==========
+    # 如果 include_drinks=True 但推荐结果中没有饮品，尝试替换最后一道菜为饮品
+    if include_drinks and len(recommended) > 1:
+        has_drink = any(
+            d.category == "甜饮品"
+            or any(kw in d.name for kw in ("茶", "酒", "莓"))
+            for d in recommended
+        )
+        if not has_drink:
+            # 从候选池找饮品（不限分类，饮料类关键词或甜饮品分类）
+            drink_pool = [d for d in candidates
+                          if d.name not in used_names
+                          and (d.category == "甜饮品"
+                               or any(kw in d.name for kw in ("茶", "酒", "莓")))]
+            if drink_pool:
+                # 替换最后一个非锅底菜品
+                for i in range(len(recommended) - 1, -1, -1):
+                    if not (recommended[i].category == "菌汤锅底" and "锅" in recommended[i].name):
+                        old_dish = recommended[i]
+                        new_drink = random.choice(drink_pool)
+                        recommended[i] = new_drink
+                        used_names.discard(old_dish.name)
+                        used_names.add(new_drink.name)
+                        cat_count[old_dish.category] = max(0, cat_count.get(old_dish.category, 1) - 1)
+                        cat_count[new_drink.category] = cat_count.get(new_drink.category, 0) + 1
+                        break
     
     # ========== 结果格式化 ==========
     
@@ -722,9 +878,15 @@ def recommend_dishes(
     total_price = sum(d.price for d in recommended)
     lines.append(f"\n合计：￥{total_price}")
     
-    # 生成推荐理由
-    reason = _generate_recommendation_reason(recommended, taste, customer_type, 
-                                           weather, season, people_count)
+    # 生成推荐理由（含规则合规说明和过敏原规避）
+    reason = _generate_recommendation_explanation(recommended, taste, customer_type,
+                                                  weather, season, allergen_avoid,
+                                                  skipped_by_rules=skipped_by_rules)
+
+    # 兜底：无规则/过敏原等特殊上下文时用简化理由
+    if not reason:
+        reason = _generate_recommendation_reason(recommended, taste, customer_type,
+                                                weather, season, people_count)
     lines.append(f"\n推荐理由：{reason}")
     
     lines.append("\n如需调整推荐，请告诉我您的其他偏好！")
@@ -867,10 +1029,15 @@ def _calculate_category_weights(category_pools, customer_type, weather, season):
         "进店必点": 1.5,
         "经典推荐": 1.0,
         "涮品": 0.8,
-        "甜饮品": 0.6,
+        "甜饮品": 1.0,
         "云岭特色": 0.9,
         "山茅野菜": 0.7,
-        "普洱黄牛肉": 0.8
+        "普洱黄牛肉": 0.8,
+        "鲜切牛肉": 0.85,
+        "热炒": 0.9,
+        "凉菜": 0.85,
+        "菌子": 0.8,
+        "锅底": 0.0,  # 锅底（非菌汤锅底）不参与评分
     }
     
     for category, dishes in category_pools.items():
@@ -918,9 +1085,13 @@ def _calculate_category_weights(category_pools, customer_type, weather, season):
 
 
 def _select_by_category_weights(category_pools, category_weights, recommended,
-                              used_names, cat_count, max_per_category, remaining_slots, total_quota):
-    """根据分类权重选择菜品"""
+                              used_names, cat_count, max_per_category, remaining_slots,
+                              total_quota, skipped_by_rules=None):
+    """根据分类权重选择菜品（集成规则引擎冲突检测）"""
     import random
+
+    if skipped_by_rules is None:
+        skipped_by_rules = []
 
     # 创建候选池（未使用的菜品）
     available_candidates = []
@@ -957,6 +1128,15 @@ def _select_by_category_weights(category_pools, category_weights, recommended,
         if cat_count.get(category, 0) >= max_per_category:
             continue
 
+        # 规则引擎冲突检测：跳过与已选菜品冲突的候选
+        try:
+            from dish_rules import has_conflict
+        except ImportError:
+            has_conflict = None
+        if has_conflict is not None and has_conflict(dish.name, used_names):
+            skipped_by_rules.append(dish.name)
+            continue
+
         # 添加到推荐列表
         recommended.append(dish)
         used_names.add(dish.name)
@@ -964,9 +1144,13 @@ def _select_by_category_weights(category_pools, category_weights, recommended,
         selected_count += 1
 
 
-def _select_from_remaining(category_pools, recommended, used_names, remaining_slots, total_quota):
-    """从剩余菜品中随机选择"""
+def _select_from_remaining(category_pools, recommended, used_names, remaining_slots,
+                          total_quota, skipped_by_rules=None):
+    """从剩余菜品中随机选择（集成规则引擎冲突检测）"""
     import random
+
+    if skipped_by_rules is None:
+        skipped_by_rules = []
 
     # 收集所有剩余菜品
     remaining_dishes = []
@@ -983,6 +1167,16 @@ def _select_from_remaining(category_pools, recommended, used_names, remaining_sl
         # P0修复：使用传入的total_quota而非_total_quota(0)，原代码固定用5导致大组推荐不足
         if len(recommended) >= total_quota:
             break
+
+        # 规则引擎冲突检测：跳过与已选菜品冲突的候选
+        try:
+            from dish_rules import has_conflict
+        except ImportError:
+            has_conflict = None
+        if has_conflict is not None and has_conflict(dish.name, used_names):
+            skipped_by_rules.append(dish.name)
+            continue
+
         recommended.append(dish)
         used_names.add(dish.name)
 
@@ -997,15 +1191,19 @@ def _generate_recommendation_reason(recommended, taste, customer_type, weather, 
     
     # 口味理由
     if taste:
+        # 处理降级格式："特辣/中辣" → 映射为较温和的描述
         taste_map = {
             "不辣": "清淡养生",
             "微辣": "温和开胃", 
             "中辣": "香辣过瘾",
             "特辣": "刺激够味",
             "酸辣": "酸爽开胃",
-            "香辣": "香气扑鼻"
+            "香辣": "香气扑鼻",
+            "辣": "够味解馋",
         }
-        reasons.append(taste_map.get(taste, taste))
+        # 降级后缀：如 taste="特辣/中辣" → 取有效辣度
+        display_taste = taste.split("/")[-1] if "/" in taste else taste
+        reasons.append(taste_map.get(display_taste, taste))
     
     # 人群类型理由
     if customer_type:

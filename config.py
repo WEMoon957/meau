@@ -32,14 +32,19 @@ if os.path.exists(_env_path):
             os.environ.setdefault(key.strip(), value.strip())
 
 # ============================================================
-# 千问 Embedding API 配置
+# 千问 Embedding API 配置（独立于对话 LLM）
 # ============================================================
-# 优先从环境变量读取（与现有项目 .env 共用），其次使用默认值
-API_KEY = os.environ.get("OPENAI_API_KEY", "sk-your-dashscope-api-key-here")
+API_KEY = os.environ.get(
+    "EMBEDDING_API_KEY",
+    os.environ.get("OPENAI_API_KEY", "sk-your-dashscope-api-key-here"),
+)
 
 BASE_URL = os.environ.get(
-    "OPENAI_BASE_URL",
-    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "EMBEDDING_BASE_URL",
+    os.environ.get(
+        "OPENAI_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    ),
 )
 
 # 向量化模型：text-embedding-v3 支持中英文，效果优秀
