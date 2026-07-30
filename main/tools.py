@@ -3,9 +3,189 @@
 菜品查询、智能推荐、菜品知识库查询，供 LangChain Agent 调用。
 """
 
+import copy
 from langchain_core.tools import tool
 
 from menu_data import Dish, get_all_dishes
+
+
+# ======================== 双源数据合并（向量库 + MySQL） ========================
+# 向量库（ChromaDB）的 dish_profile 是辣度/过敏原/人群的权威数据源，
+# MySQL 的 dishes 表是价格/分类/毛利率的结构化数据源。
+# 推荐前必须合并双源，用向量库字段补全 MySQL 的空字段，避免过滤失效。
+
+# 向量库过敏原类别到 MySQL 存储值的映射
+_KB_ALLERGEN_CATEGORIES = ["香菜", "葱", "蒜", "花生", "海鲜", "乳制品", "鸡蛋", "大豆", "麸质", "坚果"]
+# 向量库"乳制品"对应 MySQL"牛奶"
+_KB_ALLERGEN_ALIASES = {"乳制品": "牛奶", "蒜": "大蒜"}
+
+# 合并后的双源缓存（按菜名索引），避免每次推荐都重复合并
+_merged_dishes_cache: dict[str, Dish] | None = None
+# 向量库已验证过敏原的菜名集合（allergen_info 非空的菜品）
+# 这些菜品的过敏原信息以向量库为准，不再走菜名关键词兜底（避免误杀）
+_kb_allergen_verified: set[str] = set()
+
+
+def _parse_kb_allergen_info(allergen_info: str) -> list[str]:
+    """解析向量库的 allergen_info 文本，返回含过敏原的 MySQL 标准名列表
+
+    向量库格式："不含香菜，不含葱，不含蒜，不含花生，不含海鲜，不含乳制品"
+    或："含花生，不含海鲜"
+
+    Returns:
+        含过敏原的菜品返回 ["花生"]，不含的返回 []
+    """
+    if not allergen_info:
+        return []
+    contains = []
+    for kb_cat in _KB_ALLERGEN_CATEGORIES:
+        # 检查"含X"且非"不含X"
+        contain_marker = f"含{kb_cat}"
+        exclude_marker = f"不含{kb_cat}"
+        if contain_marker in allergen_info and exclude_marker not in allergen_info:
+            # 转换为 MySQL 标准名
+            mysql_name = _KB_ALLERGEN_ALIASES.get(kb_cat, kb_cat)
+            contains.append(mysql_name)
+    return contains
+
+
+def _parse_kb_spice_level(spice_level: str) -> str:
+    """归一化向量库的辣度到标准枚举
+
+    向量库可能存"微辣(芥末)"等扩展值，需归一到"微辣"
+    """
+    if not spice_level:
+        return ""
+    for std in ["不辣", "微辣", "中辣", "特辣"]:
+        if std in spice_level:
+            return std
+    return ""
+
+
+def _parse_kb_suitable_crowd(suitable_crowd: str) -> list[str]:
+    """解析向量库的 suitable_crowd 到 MySQL suitable_for 格式
+
+    向量库格式："老人、小孩" → ["老人", "小孩"]
+    注意：向量库用"小孩"，MySQL 用"儿童"，需统一
+    """
+    if not suitable_crowd:
+        return []
+    # 按顿号/逗号分隔
+    import re
+    parts = re.split(r"[、,，]", suitable_crowd)
+    result = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # "小孩" → "儿童"
+        if p == "小孩":
+            p = "儿童"
+        result.append(p)
+    return result
+
+
+def _load_kb_profiles() -> dict:
+    """从向量库加载所有 dish_profile，按菜名索引
+
+    Returns:
+        {菜名: {spice_level, allergen_info, suitable_crowd, ...}}
+        失败时返回空字典（静默降级，不阻塞推荐）
+    """
+    try:
+        import kb_query
+        profiles = kb_query._get_kb().get_all_by_type("dish_profile")
+        result = {}
+        for p in profiles:
+            meta = p.get("metadata", {})
+            name = meta.get("dish_name", "")
+            if name:
+                result[name] = meta
+        return result
+    except Exception as e:
+        # 静默降级：向量库不可用时回退到纯 MySQL 数据
+        print(f"⚠️ 向量库加载失败，回退到纯MySQL数据: {e}")
+        return {}
+
+
+def _merge_dish_with_kb(dish: Dish, kb_meta: dict) -> Dish:
+    """用向量库字段补全 MySQL Dish 对象的空字段
+
+    合并规则（向量库为权威源，仅在 MySQL 字段为空时补全）：
+    - spicy_level: MySQL 空 → 用向量库 spice_level
+    - allergens: MySQL 空 → 用向量库 allergen_info 解析结果
+    - suitable_for: MySQL 空 → 用向量库 suitable_crowd 解析结果
+
+    返回新的 Dish 对象（深拷贝，不修改原对象）
+    """
+    merged = copy.deepcopy(dish)
+
+    # 辣度补全
+    if not merged.spicy_level or merged.spicy_level == "":
+        kb_spicy = _parse_kb_spice_level(kb_meta.get("spice_level", ""))
+        if kb_spicy:
+            merged.spicy_level = kb_spicy
+
+    # 过敏原补全（MySQL allergens 为空列表时用向量库补全）
+    if not merged.allergens:
+        kb_allergens = _parse_kb_allergen_info(kb_meta.get("allergen_info", ""))
+        if kb_allergens:
+            merged.allergens = kb_allergens
+
+    # 人群补全
+    if not merged.suitable_for:
+        kb_crowd = _parse_kb_suitable_crowd(kb_meta.get("suitable_crowd", ""))
+        if kb_crowd:
+            merged.suitable_for = kb_crowd
+
+    return merged
+
+
+def get_merged_dishes() -> list[Dish]:
+    """获取双源合并后的菜品列表（向量库 + MySQL）
+
+    流程：
+    1. 从 MySQL 加载所有菜品（结构化数据：价格、分类、毛利率）
+    2. 从向量库加载所有 dish_profile（权威属性：辣度、过敏原、人群）
+    3. 按菜名匹配，用向量库字段补全 MySQL 的空字段
+    4. 返回合并后的 Dish 列表
+
+    缓存：合并结果缓存在 _merged_dishes_cache，避免重复 I/O
+    调用 invalidate_merged_cache() 可清除缓存
+
+    Returns:
+        合并后的 Dish 列表，向量库不可用时返回纯 MySQL 数据
+    """
+    global _merged_dishes_cache, _kb_allergen_verified
+    if _merged_dishes_cache is not None:
+        return list(_merged_dishes_cache.values())
+
+    mysql_dishes = get_all_dishes()
+    kb_profiles = _load_kb_profiles()
+
+    # 记录向量库已验证过敏原的菜名（allergen_info 非空即视为已验证）
+    verified = set()
+    merged_list = []
+    merged_dict = {}
+    for dish in mysql_dishes:
+        kb_meta = kb_profiles.get(dish.name, {})
+        if kb_meta.get("allergen_info"):
+            verified.add(dish.name)
+        merged = _merge_dish_with_kb(dish, kb_meta)
+        merged_list.append(merged)
+        merged_dict[dish.name] = merged
+
+    _merged_dishes_cache = merged_dict
+    _kb_allergen_verified = verified
+    return merged_list
+
+
+def invalidate_merged_cache():
+    """清除双源合并缓存（数据更新后调用）"""
+    global _merged_dishes_cache, _kb_allergen_verified
+    _merged_dishes_cache = None
+    _kb_allergen_verified = set()
+
 
 
 # ======================== 推荐算法辅助 ========================
@@ -26,13 +206,48 @@ def _filter_by_taste(candidates: list[Dish], taste: str) -> list[Dish]:
     return candidates
 
 
+# 过敏原菜名关键词兜底映射：数据标注不完整时的安全网
+# 当 allergens 字段未标注但菜名含明确关键词时，按过敏原类别兜底过滤
+_ALLERGEN_NAME_KEYWORDS = {
+    "海鲜": ("鱼", "虾", "蟹", "贝", "螺", "鱿鱼", "墨鱼", "章鱼", "扇贝", "蛤", "蚝", "鲍"),
+    "花生": ("花生",),
+    "鸡蛋": ("鸡蛋", "蛋"),
+    "牛奶": ("牛奶", "芝士", "黄油", "奶油", "双皮奶"),
+    "大豆": ("大豆", "豆腐", "豆干", "豆浆"),
+    "大蒜": ("大蒜", "蒜蓉"),
+}
+
+
 def _filter_by_allergens(candidates: list[Dish], avoid_list: list[str]) -> list[Dish]:
+    """按过敏原过滤候选菜品
+
+    过滤优先级：
+    1. allergens 字段过滤（双源合并后的权威值）
+    2. 菜名关键词兜底：仅当双源都无过敏原数据时启用（菜名不在 _kb_allergen_verified 中）
+
+    注意：向量库已明确标注过敏原的菜品（含"不含X"），不再走菜名兜底，
+    避免误杀"傣味香茅草烤鱼（不含海鲜）"这类向量库已澄清的菜品。
+    """
     if not avoid_list:
         return candidates
-    return [
-        d for d in candidates
-        if not any(allergen in d.allergens for allergen in avoid_list)
-    ]
+    result = []
+    for d in candidates:
+        # 1. 按 allergens 字段过滤（主过滤，双源合并后的权威值）
+        if any(allergen in d.allergens for allergen in avoid_list):
+            continue
+        # 2. 菜名兜底：仅当双源都无过敏原数据时启用
+        #    向量库已验证的菜品（allergen_info 非空）跳过兜底，避免误杀
+        if d.name not in _kb_allergen_verified:
+            blocked = False
+            for allergen in avoid_list:
+                keywords = _ALLERGEN_NAME_KEYWORDS.get(allergen)
+                if keywords and any(kw in d.name for kw in keywords):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+        result.append(d)
+    return result
 
 
 # 人群标签白名单：只有这些值才用于 suitable_for 硬筛选
@@ -344,8 +559,14 @@ def recommend_dishes(
     include_soup: bool = True,
     exclude_dishes: str = "",
 ) -> str:
-    """根据顾客需求智能推荐菜品。根据人数、口味、人群类型、健康标签、天气、季节、过敏原等多维度筛选并按综合评分排序推荐。评分包含毛利率权重（占 20%），优先推荐高毛利、招牌、应季菜品。当顾客表达用餐需求或请求推荐时使用。
-
+    """根据顾客需求智能推荐菜品。采用全新的多样化推荐算法，确保每次推荐都有差异性。
+    
+    推荐策略：
+    1. 强制包含锅底（火锅店业务要求）
+    2. 多维度评分 + 随机化选择
+    3. 分类均衡搭配
+    4. 动态权重调整
+    
     Args:
         people_count: 用餐人数，0表示不限制
         taste: 口味偏好：不辣/微辣/中辣/特辣/酸辣/香辣/不限
@@ -357,181 +578,157 @@ def recommend_dishes(
         include_drinks: 是否包含饮品（甜饮品分类），默认True
         include_staple: 是否包含主食类菜品，默认True
         include_soup: 是否包含汤锅类（菌汤锅底分类），默认True
-        exclude_dishes: 需要排除的菜品名称（已推荐过的），多个用逗号分隔。用于追加推荐场景避免重复。锅底名称传入后仍会推荐（火锅店必选），但会尝试换一个锅底
+        exclude_dishes: 需要排除的菜品名称（已推荐过的），多个用逗号分隔
     """
-    all_dishes = get_all_dishes()
+    import random
+    random.seed()  # 使用系统时间作为随机种子
+
+    # 双源合并：MySQL 结构化数据 + 向量库权威属性（辣度/过敏原/人群）
+    # 向量库是过敏原的权威源，避免 MySQL 字段空导致过滤失效
+    all_dishes = get_merged_dishes()
     candidates = list(all_dishes)
     avoid_list = _parse_csv(allergen_avoid)
     exclude_set = {x.strip() for x in _parse_csv(exclude_dishes) if x.strip()}
-
+    
+    # ========== 基础筛选 ==========
+    
     # 1. 口味筛选
     candidates = _filter_by_taste(candidates, taste)
-
-    # 2. 人群筛选（场景词不硬筛，只对真实人群标签筛选）
+    
+    # 2. 人群筛选
     candidates = _filter_by_customer_type(candidates, customer_type)
-
-    # 2.5 场景过滤：儿童餐等特殊菜品仅在匹配场景下推荐
+    
+    # 3. 场景过滤
     candidates = _filter_by_scene(candidates, customer_type)
-
-    # 3. 健康标签筛选
+    
+    # 4. 健康标签筛选
     if health_tags:
         for tag in _parse_csv(health_tags):
             candidates = [d for d in candidates if tag in d.dietary_tags]
-
-    # 4. 过敏原排除
+    
+    # 5. 过敏原排除
     candidates = _filter_by_allergens(candidates, avoid_list)
-
-    # 4.5 排除已推荐过的菜品（追加场景去重）
-    # 锅底不在此处排除（火锅店必选，单独处理换锅底逻辑）
+    
+    # 6. 品类开关过滤
+    if not include_drinks:
+        candidates = [d for d in candidates if d.category != "甜饮品"]
+    
+    if not include_soup:
+        candidates = [d for d in candidates
+                      if d.category != "菌汤锅底" or "锅" in d.name]
+    
+    candidates = [d for d in candidates
+                  if d.category != "菌汤锅底" or "锅" in d.name]
+    
+    if not include_staple:
+        staple_keywords = ("饵丝", "饵块", "焖饭", "糯米粉", "米线", "面")
+        candidates = [d for d in candidates
+                      if not any(kw in d.name for kw in staple_keywords)]
+    
+    # 7. 排除已推荐菜品（追加场景）
     if exclude_set:
         candidates = [d for d in candidates
                       if d.name not in exclude_set
                       or (d.category == "菌汤锅底" and "锅" in d.name)]
-
-    # 5. 品类开关过滤
-    if not include_drinks:
-        candidates = [d for d in candidates if d.category != "甜饮品"]
-    if not include_soup:
-        # 火锅店锅底必选：include_soup=False 仅过滤非锅底的汤类菜品
-        # 菌汤锅底分类中名字含"锅"的为锅底（必选），其余为汤品（如山茅野菜拼盘，可过滤）
-        candidates = [d for d in candidates
-                      if d.category != "菌汤锅底" or "锅" in d.name]
-    # 无论 include_soup 是否为 False，candidates 中菌汤锅底分类仅保留真锅底
-    # （山茅野菜拼盘是涮菜拼盘，分类标注错误，不应出现在推荐候选中）
-    candidates = [d for d in candidates
-                  if d.category != "菌汤锅底" or "锅" in d.name]
-    if not include_staple:
-        # 主食类菜名关键词过滤（菌彩特色分类里包含主食）
-        staple_keywords = ("饵丝", "饵块", "焖饭", "糯米粉", "米线", "面")
-        candidates = [d for d in candidates
-                      if not any(kw in d.name for kw in staple_keywords)]
-
-    # 6. 天气/季节匹配（加分项）
-    weather_set = {id(d) for d in candidates if weather and weather in d.weather_fit}
-    season_set = {id(d) for d in candidates if season and season in d.seasonal}
-
-    # 按评分排序（毛利率占 20%）
-    candidates.sort(key=lambda d: -_dish_score(d, weather_set, season_set))
-
-    # 加载菜品规则引擎（互斥规则/避雷搭配）
-    try:
-        from dish_rules import has_conflict, get_rule_warnings
-        rules_enabled = True
-    except Exception:
-        rules_enabled = False
-
-    # 按总数推荐，同分类最多 _MAX_PER_CATEGORY 道
+    
+    # ========== 推荐逻辑 ==========
+    
+    # 计算推荐数量
     total_quota = _total_quota(people_count)
-    recommended: list[Dish] = []
-    used_names: set[str] = set()
-    cat_count: dict[str, int] = {}
-    skipped_by_rules: list[str] = []
-
-    def _try_fill(pool: list[Dish], enforce_cat_limit: bool) -> None:
-        """从 pool 中按评分顺序填充推荐列表"""
-        for d in pool:
-            if len(recommended) >= total_quota:
-                break
-            if d.name in used_names:
-                continue
-            if enforce_cat_limit and cat_count.get(d.category, 0) >= _MAX_PER_CATEGORY:
-                continue
-            if rules_enabled and has_conflict(d.name, used_names):
-                skipped_by_rules.append(d.name)
-                continue
-            recommended.append(d)
-            used_names.add(d.name)
-            cat_count[d.category] = cat_count.get(d.category, 0) + 1
-
-    # 火锅店必选锅底：至少 1 道菌汤锅底，不受口味/人群/健康标签筛选
-    # 仅受过敏原限制；优先选名字含"锅"的真锅底，计入总配额，排在推荐列表首位
-    # 蒜过敏兜底：若所有锅底均含过敏原，仍推荐唯一锅底并提示用户
-    # 追加去重：若已推荐过锅底且存在其他锅底，则换一个不同的锅底
+    recommended = []
+    used_names = set()
+    cat_count = {}
+    
+    # ========== 锅底强制推荐 ==========
+    
     pot_pool = _filter_by_allergens(
         [d for d in all_dishes if d.category == "菌汤锅底" and "锅" in d.name],
         avoid_list,
     )
-    pot_warning = ""
-    if not pot_pool:
-        # 兜底：所有锅底均含过敏原，取唯一锅底并生成提示
-        all_pots = [d for d in all_dishes if d.category == "菌汤锅底" and "锅" in d.name]
-        if all_pots:
-            pot_pool = all_pots
-            pot_warning = f"⚠️ 提示：本店锅底「{all_pots[0].name}」含 {allergen_avoid or '过敏原'}，"
-            if avoid_list:
-                pot_warning += f"无法避开，请确认是否可接受；"
+    
     if pot_pool:
-        pot_pool.sort(key=lambda d: -_dish_score(d, weather_set, season_set))
-        # 追加场景：优先选未排除的锅底；若全部已排除（只有一个锅底），仍推荐唯一锅底
-        if exclude_set:
-            fresh_pots = [d for d in pot_pool if d.name not in exclude_set]
-            mandatory_pot = fresh_pots[0] if fresh_pots else pot_pool[0]
+        # 选择锅底：优先未排除的，否则随机选择
+        available_pots = [d for d in pot_pool if d.name not in exclude_set]
+        if available_pots:
+            selected_pot = random.choice(available_pots)
         else:
-            mandatory_pot = pot_pool[0]
-        recommended.append(mandatory_pot)
-        used_names.add(mandatory_pot.name)
-        cat_count[mandatory_pot.category] = 1
+            selected_pot = random.choice(pot_pool)
+        
+        recommended.append(selected_pot)
+        used_names.add(selected_pot.name)
+        cat_count[selected_pot.category] = 1
+    
+    # ========== 多样化推荐算法 ==========
+    
+    # 将候选池按分类分组
+    category_pools = {}
+    for dish in candidates:
+        if dish.name not in used_names:
+            if dish.category not in category_pools:
+                category_pools[dish.category] = []
+            category_pools[dish.category].append(dish)
+    
+    # 为每个分类计算动态权重
+    category_weights = _calculate_category_weights(category_pools, customer_type, weather, season)
+    
+    # 多轮选择，确保分类均衡
+    for round_num in range(3):  # 最多3轮选择
+        if len(recommended) >= total_quota:
+            break
 
-    # 第一轮：从筛选后候选中选，同分类限 2 道
-    _try_fill(candidates, enforce_cat_limit=True)
+        # 每轮重新计算剩余配额（P0修复：原代码remaining_slots只算一次，导致后续轮次可能超额）
+        remaining_slots = total_quota - len(recommended)
 
-    # 第二轮：候选不足时，放宽同分类限制（仍从筛选候选中选）
-    if len(recommended) < total_quota:
-        _try_fill(candidates, enforce_cat_limit=False)
-
-    # 第三轮：仍不足时，从全菜单补充（放宽口味限制，仅保留过敏原过滤）
-    if len(recommended) < total_quota:
-        fallback_pool = _filter_by_allergens(all_dishes, avoid_list)
-        fallback_pool.sort(key=lambda d: -_dish_score(d, weather_set, season_set))
-        _try_fill(fallback_pool, enforce_cat_limit=False)
-
-    # 按分类分组展示：菜名+价格在前，推荐理由放最后
-    # 按分类在推荐中的出现顺序展示
-    cat_order: list[str] = []
+        # 根据轮次调整选择策略
+        if round_num == 0:
+            # 第一轮：优先高权重分类，每个分类最多2个
+            _select_by_category_weights(category_pools, category_weights, recommended,
+                                     used_names, cat_count, max_per_category=2,
+                                     remaining_slots=remaining_slots, total_quota=total_quota)
+        elif round_num == 1:
+            # 第二轮：放宽分类限制，但保持多样性
+            _select_by_category_weights(category_pools, category_weights, recommended,
+                                     used_names, cat_count, max_per_category=3,
+                                     remaining_slots=remaining_slots, total_quota=total_quota)
+        else:
+            # 第三轮：从剩余菜品中随机选择
+            _select_from_remaining(category_pools, recommended, used_names,
+                                 remaining_slots, total_quota)
+    
+    # ========== 结果格式化 ==========
+    
+    # 按分类分组展示
+    cat_order = []
     for d in recommended:
         if d.category not in cat_order:
             cat_order.append(d.category)
-
+    
     lines = ["为您推荐以下菜品：\n"]
-    if pot_warning:
-        lines.append(pot_warning + "\n")
-
-    total_price = 0.0
-    idx = 1
-    for cat in cat_order:
-        cat_dishes = [d for d in recommended if d.category == cat]
-        if cat_dishes:
-            lines.append(f"--- {cat} ---")
-            for d in cat_dishes:
-                sig = " ★招牌" if d.is_signature else ""
-                spicy = f" [{d.spicy_level}]" if d.spicy_level and d.spicy_level != "不辣" else ""
-                lines.append(f"  {idx}. {d.name}  ￥{d.price}{spicy}{sig}")
-                total_price += d.price
-                idx += 1
-            lines.append("")
-
-    lines.append(f"合计：￥{total_price:.0f}")
-
-    # 推荐理由：基于规则引擎和向量库生成
-    explanation = _generate_recommendation_explanation(
-        recommended=recommended,
-        taste=taste,
-        customer_type=customer_type,
-        weather=weather,
-        season=season,
-        allergen_avoid=allergen_avoid,
-        skipped_by_rules=skipped_by_rules if skipped_by_rules else None,
-    )
-    if explanation:
-        lines.append(f"\n推荐理由：{explanation}")
-
-    # 规则合规验证：再次检查推荐结果无冲突
-    if rules_enabled:
-        rule_warnings = get_rule_warnings([d.name for d in recommended])
-        if rule_warnings:
-            lines.append(f"\n{rule_warnings}")
-
+    
+    for category in cat_order:
+        category_dishes = [d for d in recommended if d.category == category]
+        
+        if category_dishes:
+            lines.append(f"\n--- {category} ---")
+            for i, dish in enumerate(category_dishes, 1):
+                # 调整序号，避免从1开始重新计数
+                global_idx = sum(len([d for d in recommended if d.category == cat]) 
+                               for cat in cat_order[:cat_order.index(category)]) + i
+                lines.append(f"  {global_idx}. {dish.name}  ￥{dish.price}")
+                if hasattr(dish, 'spicy_level') and dish.spicy_level:
+                    lines.append(f"     [{dish.spicy_level}]")
+    
+    # 计算总价
+    total_price = sum(d.price for d in recommended)
+    lines.append(f"\n合计：￥{total_price}")
+    
+    # 生成推荐理由
+    reason = _generate_recommendation_reason(recommended, taste, customer_type, 
+                                           weather, season, people_count)
+    lines.append(f"\n推荐理由：{reason}")
+    
     lines.append("\n如需调整推荐，请告诉我您的其他偏好！")
+    
     return "\n".join(lines)
 
 
@@ -653,6 +850,198 @@ def get_fruit_allergen_info(query: str) -> str:
     from kb_query import search_fruit_allergens
     results = search_fruit_allergens(query, top_k=5)
     return _format_kb_results(results, query)
+
+
+# ======================== 多样化推荐算法辅助函数 ========================
+
+def _calculate_category_weights(category_pools, customer_type, weather, season):
+    """计算各分类的动态权重"""
+    import random
+    weights = {}
+    
+    # 基础权重
+    base_weights = {
+        "菌汤锅底": 0.0,  # 锅底已单独处理
+        "菌彩特色": 1.2,
+        "山珍菌宴": 1.0,
+        "进店必点": 1.5,
+        "经典推荐": 1.0,
+        "涮品": 0.8,
+        "甜饮品": 0.6,
+        "云岭特色": 0.9,
+        "山茅野菜": 0.7,
+        "普洱黄牛肉": 0.8
+    }
+    
+    for category, dishes in category_pools.items():
+        if not dishes:
+            continue
+            
+        # 基础权重
+        weight = base_weights.get(category, 1.0)
+        
+        # 根据人群类型调整权重
+        if customer_type == "老人":
+            if category in ["涮品", "山茅野菜"]:
+                weight *= 0.7  # 老人少推荐涮菜和野菜
+        elif customer_type == "儿童":
+            if category in ["甜饮品"]:
+                weight *= 1.3  # 儿童多推荐饮品
+        elif customer_type == "聚餐":
+            if category in ["进店必点", "经典推荐"]:
+                weight *= 1.2  # 聚餐多推荐招牌菜
+        
+        # 根据天气调整权重
+        if weather == "热天":
+            if category in ["甜饮品"]:
+                weight *= 1.3  # 热天多推荐饮品
+            elif category in ["菌汤锅底"]:
+                weight *= 0.8  # 热天少推荐热锅
+        elif weather == "冷天":
+            if category in ["菌汤锅底"]:
+                weight *= 1.2  # 冷天多推荐热锅
+        
+        # 根据季节调整权重
+        if season == "夏":
+            if category in ["甜饮品", "涮品"]:
+                weight *= 1.1
+        elif season == "冬":
+            if category in ["菌汤锅底", "普洱黄牛肉"]:
+                weight *= 1.1
+        
+        # 添加随机因子
+        weight *= random.uniform(0.8, 1.2)
+        
+        weights[category] = max(0.1, weight)  # 确保权重不为负
+    
+    return weights
+
+
+def _select_by_category_weights(category_pools, category_weights, recommended,
+                              used_names, cat_count, max_per_category, remaining_slots, total_quota):
+    """根据分类权重选择菜品"""
+    import random
+
+    # 创建候选池（未使用的菜品）
+    available_candidates = []
+    for category, dishes in category_pools.items():
+        for dish in dishes:
+            if dish.name not in used_names:
+                # 添加权重信息
+                weighted_dish = {
+                    'dish': dish,
+                    'category': category,
+                    'weight': category_weights.get(category, 1.0)
+                }
+                available_candidates.append(weighted_dish)
+
+    if not available_candidates:
+        return
+
+    # 按权重排序，但引入随机性
+    available_candidates.sort(key=lambda x: x['weight'] * random.uniform(0.8, 1.2), reverse=True)
+
+    # 选择菜品
+    selected_count = 0
+    for candidate in available_candidates:
+        if selected_count >= remaining_slots:
+            break
+        # P0修复：检查是否已达总配额，防止超额推荐
+        if len(recommended) >= total_quota:
+            break
+
+        dish = candidate['dish']
+        category = candidate['category']
+
+        # 检查分类限制
+        if cat_count.get(category, 0) >= max_per_category:
+            continue
+
+        # 添加到推荐列表
+        recommended.append(dish)
+        used_names.add(dish.name)
+        cat_count[category] = cat_count.get(category, 0) + 1
+        selected_count += 1
+
+
+def _select_from_remaining(category_pools, recommended, used_names, remaining_slots, total_quota):
+    """从剩余菜品中随机选择"""
+    import random
+
+    # 收集所有剩余菜品
+    remaining_dishes = []
+    for dishes in category_pools.values():
+        for dish in dishes:
+            if dish.name not in used_names:
+                remaining_dishes.append(dish)
+
+    # 随机选择
+    random.shuffle(remaining_dishes)
+
+    # 添加到推荐列表
+    for dish in remaining_dishes:
+        # P0修复：使用传入的total_quota而非_total_quota(0)，原代码固定用5导致大组推荐不足
+        if len(recommended) >= total_quota:
+            break
+        recommended.append(dish)
+        used_names.add(dish.name)
+
+
+def _generate_recommendation_reason(recommended, taste, customer_type, weather, season, people_count):
+    """生成推荐理由"""
+    reasons = []
+    
+    # 基础理由
+    if people_count > 0:
+        reasons.append(f"适合{people_count}人用餐")
+    
+    # 口味理由
+    if taste:
+        taste_map = {
+            "不辣": "清淡养生",
+            "微辣": "温和开胃", 
+            "中辣": "香辣过瘾",
+            "特辣": "刺激够味",
+            "酸辣": "酸爽开胃",
+            "香辣": "香气扑鼻"
+        }
+        reasons.append(taste_map.get(taste, taste))
+    
+    # 人群类型理由
+    if customer_type:
+        if customer_type == "老人":
+            reasons.append("长辈适宜")
+        elif customer_type == "儿童":
+            reasons.append("儿童喜爱")
+        elif customer_type == "聚餐":
+            reasons.append("聚会分享")
+        elif customer_type == "情侣":
+            reasons.append("浪漫温馨")
+    
+    # 天气理由
+    if weather:
+        weather_map = {
+            "热天": "清爽解暑",
+            "冷天": "暖身暖心", 
+            "雨天": "驱寒暖胃"
+        }
+        reasons.append(weather_map.get(weather, weather))
+    
+    # 季节理由
+    if season:
+        season_map = {
+            "春": "春意盎然",
+            "夏": "夏日清爽",
+            "秋": "秋补养生",
+            "冬": "冬暖滋补"
+        }
+        reasons.append(season_map.get(season, season))
+    
+    # 如果没有特定理由，使用默认理由
+    if not reasons:
+        reasons.append("精心搭配")
+    
+    return "、".join(reasons) + "组合"
 
 
 # 所有工具列表（供 Agent 使用）

@@ -23,8 +23,8 @@ import sys
 import uuid
 
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import load_dotenv, find_dotenv
+    load_dotenv(find_dotenv())
 except ImportError:
     pass
 
@@ -85,7 +85,7 @@ import db as _db
 
 
 # ======================== 配置 ========================
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "qwen-turbo")
+DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "qwen3.7-max")
 MAX_CONCURRENT_CHATS = int(os.environ.get("MAX_CONCURRENT_CHATS", "20"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
@@ -195,7 +195,7 @@ async def _run_limiter_cleanup():
 
 
 # ======================== FastAPI 应用 ========================
-app = FastAPI(title="小味点餐智能体 API", lifespan=lifespan)
+app = FastAPI(title="小菌点餐智能体 API", lifespan=lifespan)
 
 
 def _load_cors_origins() -> list[str]:
@@ -215,7 +215,6 @@ def _load_cors_origins() -> list[str]:
         "http://127.0.0.1:5173",
         "null",  # 允许 file:// 协议（桌面双击 HTML）访问
     ]
-
 
 app.add_middleware(
     CORSMiddleware,
