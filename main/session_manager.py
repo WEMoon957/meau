@@ -100,7 +100,7 @@ class SessionManager:
         self._mem_locks_guard = threading.Lock()
 
     # ---------- 核心对话 ----------
-    def chat(self, session_id: str, user_input: str) -> str:
+    def chat(self, session_id: str, user_input: str, membership_level: str = "") -> str:
         """加载历史 -> 调用 agent -> 回写历史。
 
         通过每会话锁串行化同一 session_id 的并发请求，防止 load-modify-save
@@ -110,7 +110,7 @@ class SessionManager:
         lock_token = self._acquire_lock(session_id)
         try:
             history = self._load_history(session_id)
-            response, new_msgs = self.agent.chat(user_input, history)
+            response, new_msgs = self.agent.chat(user_input, history, membership_level)
             new_history = (history + new_msgs)[-self.agent.MAX_HISTORY:]
             self._save_history(session_id, new_history)
             return response

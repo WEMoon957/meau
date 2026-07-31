@@ -144,11 +144,17 @@
         const chatArea = document.getElementById('chatArea');
 
         // ========== 修改：后端 API 地址 ==========
-        const API_URL = 'http://172.16.11.82:3000/api/ai/chat';
-        const RESET_URL = 'http://172.16.11.82:3000/api/ai/reset';
+        const API_URL = 'http://127.0.0.1:3000/api/ai/chat';
+        const RESET_URL = 'http://127.0.0.1:3000/api/ai/reset';
 
         // ========== 关键：保存 session_id 用于连续对话 ==========
-        let sessionId = '';
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+        let sessionId = generateUUID();
 
         function escapeHtml(s) {
             return String(s).replace(/[&<>"']/g, c => ({
@@ -277,7 +283,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     // ========== 关键：始终带上 session_id ==========
-                    body: JSON.stringify({ message: text, session_id: sessionId })
+                    body: JSON.stringify({ user_message: text, session_id: sessionId })
                 });
 
                 if (!resp.ok) {

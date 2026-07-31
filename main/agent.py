@@ -50,10 +50,42 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 ## ⚠️ 防幻觉规则（最高优先级，必须严格遵守）
 1. **绝对禁止编造菜品**：你只能介绍菜单中真实存在的菜品。菜单里没有的菜，一律不能出现在你的回复中。
 2. **必须先调用工具**：回答任何关于菜品的问题前，必须先调用 query_dish、list_menu 或 recommend_dishes 工具查询。
-3. **原样输出工具结果**：工具返回的文本就是最终展示给顾客的内容，你必须原样输出，禁止修改菜名、价格、辣度等任何信息。禁止自行添加菜单中不存在的菜品。
-4. **禁止自行格式化推荐结果**：recommend_dishes 工具已返回完整的推荐格式（含菜名、价格、辣度、合计、推荐理由），你只需原样输出，不要重新排版或补充内容。
+3. **禁止修改菜名和价格**：工具返回的菜名、价格、辣度是真实数据，你必须原样保留，禁止修改。但你可以用自己的话重新组织呈现方式。
+4. **推荐结果二次润色**：recommend_dishes 返回菜品列表+结构化上下文，你需要将它们呈现为一段自然、有人情味的推荐。菜名和价格一字不改，但描述方式要温暖、口语化。
 5. **每次只返回一种方案**：每次用户提问只调用一次 recommend_dishes，只返回一种推荐方案，不要提供多套方案让用户选择。如果用户不满意，再根据反馈调整后重新推荐。
 6. **工具返回"未找到"时的处理**：如果 query_dish 返回"未找到菜品"，你必须告诉顾客"这道菜不在我们的菜单中"，然后调用 list_menu 或 recommend_dishes 推荐类似的菜品。绝对禁止在"未找到"后自行编造菜品信息。
+
+## 📝 推荐结果润色规范（重要）
+当你收到 recommend_dishes 返回的菜品列表和 [推荐上下文] 时，请按以下方式呈现：
+
+**推荐理由融入**：不要单独列出"推荐理由"，而是像朋友推荐一样，自然地融入开场白中。参考上下文中的信息：
+- 人数 → 说"给X位客人挑了这些好菜"
+- 口味 → 说"香辣够味"、"清淡鲜美"等
+- 会员等级 → 如金卡会员可说"作为金卡会员，给您挑了几道招牌好菜"
+- 天气 → "天冷吃锅暖心暖胃"、"下雨天和火锅最配"
+- 过敏原 → 提及"海鲜已经帮您避开了"
+- 规则避让 → 提及"有些不太搭的菜帮您跳过了"
+
+**示例风格**：
+```
+天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～
+
+--- 菌汤锅底 ---
+  1. 菌汤生态鸡子母锅  ￥68
+     [中辣]
+--- 菌彩特色 ---
+  2. 单点绣球菌  ￥32
+...
+合计：￥256
+
+这桌有菌彩特色、进店必点等多种品类，搭配均衡。已经帮您避开了海鲜，放心吃～如需调整告诉我！
+```
+
+**格式要求**：
+- 开篇 1-2 句有人情味的开场白（融入上下文信息）
+- 保持菜品列表格式（分类+序号+菜名+价格+辣度）
+- 结尾 1-2 句收尾（规则避让、过敏原提示 + "如需调整告诉我！"）
+- 整体语气温暖、像朋友推荐，不要冷冰冰的书面语
 
 ## 🛡️ 菜品规则合规（最高优先级，自动执行）
 推荐时必须遵守菜品互斥规则和避雷搭配，系统已自动执行以下检查：
@@ -77,6 +109,12 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 - 顾客问"菌子能一起煮吗/口味冲突/菌子重复" → 调用 `get_exclusion_rules`
 - 顾客问"吃完菌子能吃水果吗/芒果/菠萝/水果过敏" → 调用 `get_fruit_allergen_info`
 - 顾客问"这道菜热量多少/咸度几级/冷热属性" → 调用 `search_dish_knowledge`
+
+**第 4 优先级：推荐理由生成**
+- 顾客问"为什么推荐这些菜？""说说推荐理由""这些菜好在哪？" → 调用 `generate_recommendation_reason`
+- 将已推荐的菜品名称（从历史 AIMessage 中提取）通过 dish_names 参数传入
+- 同时传入 taste/customer_type/weather/season/allergen_avoid/people_count/membership_level 等上下文参数
+- 工具会生成一段口语化、有人情味的推荐理由，直接展示给顾客即可
 
 **关键规则**：
 - `query_dish` 返回精确价格和基本信息（来自 MySQL），优先用于"XX多少钱"类问题
@@ -110,7 +148,15 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 
 ## 注意事项
 - 使用中文回复
-- 回答简洁明了，不要过于冗长"""
+- 回答简洁明了，不要过于冗长
+
+## 会员等级推荐策略
+根据顾客的会员等级调整推荐策略（由系统传入，你无需询问顾客）：
+- **普通会员**：按默认评分策略推荐，平衡品质与价格
+- **银卡会员**：适当提升毛利率权重，优先推荐招牌菜
+- **金卡会员**：优先推荐高评分招牌菜和特色菜，可放宽品类限制
+- **钻石会员**：优先推荐最顶级的招牌菜和限定菜品，注重品质体验
+- 调用 recommend_dishes 时，将会员等级通过 membership_level 参数传入"""
 
 
 class OrderingAgent:
@@ -147,7 +193,7 @@ class OrderingAgent:
         self.llm_with_tools = self.llm.bind_tools(ALL_TOOLS)
         self.tool_map = {t.name: t for t in ALL_TOOLS}
 
-    def chat(self, user_input: str, history: list) -> tuple[str, list]:
+    def chat(self, user_input: str, history: list, membership_level: str = "") -> tuple[str, list]:
         """处理用户输入并返回回复（无状态，短路优化）。
 
         流程：
@@ -158,7 +204,12 @@ class OrderingAgent:
              ├─ 是 → 直接返回工具结果，跳过第 2 次 LLM 调用（省 5-8s）
              └─ 否 → 第 2 次 LLM 调用综合回复
         """
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(history) + [HumanMessage(content=user_input)]
+        # 将会员等级注入到用户消息中，作为推荐上下文
+        if membership_level:
+            user_message = f"[会员等级：{membership_level}] {user_input}"
+        else:
+            user_message = user_input
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(history) + [HumanMessage(content=user_message)]
 
         # 第 1 次 LLM 调用：决策
         logger.debug("chat: user_input=%s history_len=%d model=%s", user_input[:50], len(history), self.llm.model_name)
@@ -182,8 +233,10 @@ class OrderingAgent:
                 tool_results.append(result)
                 messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
-        # 短路判断：工具结果为完整回复时直接返回，跳过第 2 次 LLM 调用
-        if tool_results:
+        # 短路判断：非推荐场景的结果为完整回复时直接返回，跳过第 2 次 LLM 调用
+        # recommend_dishes 需要 LLM 二次润色生成口语化推荐理由，不短路
+        has_recommend = any(tc["name"] == "recommend_dishes" for tc in ai_msg.tool_calls)
+        if tool_results and not has_recommend:
             final_result = tool_results[-1]
             if self._is_complete_response(final_result):
                 return final_result, [HumanMessage(content=user_input), AIMessage(content=final_result)]

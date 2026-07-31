@@ -361,153 +361,6 @@ def _filter_by_customer_type(candidates: list[Dish], customer_type: str) -> list
     return result
 
 
-def _generate_recommendation_explanation(
-    recommended: list[Dish],
-    taste: str = "",
-    customer_type: str = "",
-    weather: str = "",
-    season: str = "",
-    allergen_avoid: str = "",
-    skipped_by_rules: list[str] = None,
-) -> str:
-    """基于规则引擎和向量库生成推荐理由
-
-    结构：
-      1. 用户偏好回显（口味/人群/天气/季节）
-      2. 搭配关系说明（从向量库检索匹配的套餐方案）
-      3. 规则合规说明（避开冲突菜品的数量和规则文本）
-      4. 过敏原规避说明
-    """
-    reasons: list[str] = []
-
-    # 1. 用户偏好回显
-    prefs: list[str] = []
-    if taste:
-        prefs.append(f"口味偏好「{taste}」")
-    if customer_type:
-        prefs.append(f"适合「{customer_type}」")
-    if weather:
-        prefs.append(f"天气「{weather}」")
-    if season:
-        prefs.append(f"时令「{season}」")
-    if prefs:
-        reasons.append("、".join(prefs))
-
-    # 2. 搭配关系说明（从向量库检索匹配的搭配方案）
-    pairing_note = _find_pairing_evidence(recommended, customer_type, taste)
-    if pairing_note:
-        reasons.append(pairing_note)
-
-    # 3. 规则合规说明
-    if skipped_by_rules:
-        # 从规则引擎取出被避开的具体规则文本，挑 1-2 条最具代表性的展示
-        rule_detail = _extract_rule_detail(recommended, skipped_by_rules)
-        if rule_detail:
-            reasons.append(f"已自动避开 {len(skipped_by_rules)} 道冲突菜品（{rule_detail}）")
-        else:
-            reasons.append(f"已根据菜品互斥规则自动避开 {len(skipped_by_rules)} 道冲突菜品")
-
-    # 4. 过敏原规避说明
-    if allergen_avoid:
-        reasons.append(f"已避开过敏原「{allergen_avoid}」")
-
-    return "；".join(reasons) if reasons else ""
-
-
-def _find_pairing_evidence(recommended: list[Dish], customer_type: str, taste: str) -> str:
-    """从向量库检索匹配的搭配方案，生成搭配关系说明
-
-    检索逻辑：
-      - 用推荐菜品名 + 场景词组合成查询
-      - 从 combo_plan 类型中检索 top1 相关方案
-      - 若相关度 > 0.5，引用方案名称作为搭配依据
-    """
-    if not recommended:
-        return ""
-
-    try:
-        from kb_query import search_combo_plans
-    except Exception:
-        return ""
-
-    # 构造查询：用前几道菜名 + 场景词
-    dish_names_sample = "、".join(d.name for d in recommended[:3])
-    scene_word = customer_type or taste or ""
-    query = f"{scene_word} {dish_names_sample} 搭配方案"
-
-    try:
-        results = search_combo_plans(query, top_k=1)
-    except Exception:
-        return ""
-
-    if not results:
-        return ""
-
-    top = results[0]
-    score = top.get("score", 0)
-    # 相关度阈值：只引用相关度较高的方案
-    if score < 0.5:
-        return ""
-
-    meta = top.get("metadata", {})
-    section = meta.get("section", "")
-    text = top.get("text", "")
-
-    # 从方案文本中提取简短描述（排除 section 名本身，避免重复）
-    brief = ""
-    if text:
-        # 取第一句
-        first_sentence = text.split("。")[0].split("；")[0].split("\n")[0].strip()
-        # 去掉与 section 重复的内容
-        if first_sentence and first_sentence != section:
-            brief = first_sentence[:50]
-
-    if section:
-        if brief:
-            return f"参考「{section}」搭配方案（{brief}）"
-        return f"参考「{section}」搭配方案"
-    return ""
-
-
-def _extract_rule_detail(recommended: list[Dish], skipped_by_rules: list[str]) -> str:
-    """从规则引擎提取被避开菜品的具体规则说明
-
-    返回简短的规则描述，如"菌子重复""口味冲突"等
-    """
-    try:
-        from dish_rules import _get_rules
-        engine = _get_rules()
-    except Exception:
-        return ""
-
-    if not engine.rule_texts:
-        return ""
-
-    # 在规则文本中查找涉及被避开菜品的规则
-    relevant_rules: list[str] = []
-    skipped_set = set(skipped_by_rules)
-    for rule in engine.rule_texts:
-        # 规则涉及的菜品与被避开菜品有交集
-        if set(rule["dishes"]) & skipped_set:
-            section = rule.get("section", "")
-            # 清理 section 名：去掉 emoji 和括号说明，保留核心
-            if section:
-                # 去掉常见 emoji 和装饰符号
-                clean = section.replace("❌", "").replace("⚠️", "").strip()
-                # 去掉括号及内容，如"避雷搭配（点菜避开这些组合）" → "避雷搭配"
-                if "（" in clean:
-                    clean = clean.split("（")[0].strip()
-                if clean and clean not in relevant_rules:
-                    relevant_rules.append(clean)
-            if len(relevant_rules) >= 2:
-                break
-
-    if relevant_rules:
-        return "、".join(relevant_rules[:2])
-
-    return ""
-
-
 # 菜名含这些关键词的菜品，仅在 customer_type 匹配时才纳入推荐
 # 避免给成年人聚餐推荐儿童餐等场景不匹配的情况
 _SPECIAL_DISH_KEYWORDS = {
@@ -667,6 +520,7 @@ def recommend_dishes(
     include_staple: bool = True,
     include_soup: bool = True,
     exclude_dishes: str = "",
+    membership_level: str = "",
 ) -> str:
     """根据顾客需求智能推荐菜品。采用全新的多样化推荐算法，确保每次推荐都有差异性。
     
@@ -675,6 +529,7 @@ def recommend_dishes(
     2. 多维度评分 + 随机化选择
     3. 分类均衡搭配
     4. 动态权重调整
+    5. 会员等级加权（会员等级越高，越倾向推荐高评分招牌菜和特色菜）
     
     Args:
         people_count: 用餐人数，0表示不限制
@@ -688,6 +543,7 @@ def recommend_dishes(
         include_staple: 是否包含主食类菜品，默认True
         include_soup: 是否包含汤锅类（菌汤锅底分类），默认True
         exclude_dishes: 需要排除的菜品名称（已推荐过的），多个用逗号分隔
+        membership_level: 会员等级：普通会员/银卡会员/金卡会员/钻石会员
     """
     import random
     random.seed()  # 使用系统时间作为随机种子
@@ -793,7 +649,7 @@ def recommend_dishes(
             category_pools[dish.category].append(dish)
     
     # 为每个分类计算动态权重
-    category_weights = _calculate_category_weights(category_pools, customer_type, weather, season)
+    category_weights = _calculate_category_weights(category_pools, customer_type, weather, season, membership_level)
     
     # 多轮选择，确保分类均衡
     # 规则引擎：跟踪被冲突规则跳过的菜品名称
@@ -878,18 +734,11 @@ def recommend_dishes(
     total_price = sum(d.price for d in recommended)
     lines.append(f"\n合计：￥{total_price}")
     
-    # 生成推荐理由（含规则合规说明和过敏原规避）
-    reason = _generate_recommendation_explanation(recommended, taste, customer_type,
-                                                  weather, season, allergen_avoid,
-                                                  skipped_by_rules=skipped_by_rules)
-
-    # 兜底：无规则/过敏原等特殊上下文时用简化理由
-    if not reason:
-        reason = _generate_recommendation_reason(recommended, taste, customer_type,
-                                                weather, season, people_count)
-    lines.append(f"\n推荐理由：{reason}")
-    
-    lines.append("\n如需调整推荐，请告诉我您的其他偏好！")
+    # 结构化上下文（供 LLM 二次生成口语化推荐理由）
+    ctx = _build_recommend_context(taste, customer_type, weather, season,
+                                   allergen_avoid, people_count, membership_level,
+                                   recommended, skipped_by_rules)
+    lines.append(ctx)
     
     return "\n".join(lines)
 
@@ -1016,8 +865,8 @@ def get_fruit_allergen_info(query: str) -> str:
 
 # ======================== 多样化推荐算法辅助函数 ========================
 
-def _calculate_category_weights(category_pools, customer_type, weather, season):
-    """计算各分类的动态权重"""
+def _calculate_category_weights(category_pools, customer_type, weather, season, membership_level=""):
+    """计算各分类的动态权重（含会员等级加权）"""
     import random
     weights = {}
     
@@ -1039,6 +888,15 @@ def _calculate_category_weights(category_pools, customer_type, weather, season):
         "菌子": 0.8,
         "锅底": 0.0,  # 锅底（非菌汤锅底）不参与评分
     }
+    
+    # 会员等级权重加成（乘法因子，叠加到各分类基础权重之上）
+    membership_boost = {
+        "普通会员": {"进店必点": 1.0, "菌彩特色": 1.0, "经典推荐": 1.0},
+        "银卡会员": {"进店必点": 1.15, "菌彩特色": 1.1, "经典推荐": 1.1},
+        "金卡会员": {"进店必点": 1.3, "菌彩特色": 1.25, "经典推荐": 1.2, "云岭特色": 1.1, "山珍菌宴": 1.1},
+        "钻石会员": {"进店必点": 1.5, "菌彩特色": 1.4, "经典推荐": 1.3, "云岭特色": 1.2, "山珍菌宴": 1.2, "鲜切牛肉": 1.1},
+    }
+    level_boost = membership_boost.get(membership_level, {})
     
     for category, dishes in category_pools.items():
         if not dishes:
@@ -1075,6 +933,10 @@ def _calculate_category_weights(category_pools, customer_type, weather, season):
         elif season == "冬":
             if category in ["菌汤锅底", "普洱黄牛肉"]:
                 weight *= 1.1
+        
+        # 会员等级加成
+        if category in level_boost:
+            weight *= level_boost[category]
         
         # 添加随机因子
         weight *= random.uniform(0.8, 1.2)
@@ -1181,65 +1043,152 @@ def _select_from_remaining(category_pools, recommended, used_names, remaining_sl
         used_names.add(dish.name)
 
 
-def _generate_recommendation_reason(recommended, taste, customer_type, weather, season, people_count):
-    """生成推荐理由"""
-    reasons = []
-    
-    # 基础理由
-    if people_count > 0:
-        reasons.append(f"适合{people_count}人用餐")
-    
-    # 口味理由
+def _build_recommend_context(taste, customer_type, weather, season,
+                             allergen_avoid, people_count, membership_level,
+                             recommended, skipped_by_rules):
+    """构建结构化上下文（供 LLM 二次润色生成推荐理由，不面向顾客展示）"""
+    ctx_parts = ["\n[推荐上下文]"]
+    if people_count:
+        ctx_parts.append(f"人数：{people_count}人")
     if taste:
-        # 处理降级格式："特辣/中辣" → 映射为较温和的描述
-        taste_map = {
-            "不辣": "清淡养生",
-            "微辣": "温和开胃", 
-            "中辣": "香辣过瘾",
-            "特辣": "刺激够味",
-            "酸辣": "酸爽开胃",
-            "香辣": "香气扑鼻",
-            "辣": "够味解馋",
-        }
-        # 降级后缀：如 taste="特辣/中辣" → 取有效辣度
-        display_taste = taste.split("/")[-1] if "/" in taste else taste
-        reasons.append(taste_map.get(display_taste, taste))
-    
-    # 人群类型理由
+        ctx_parts.append(f"口味：{taste}")
     if customer_type:
-        if customer_type == "老人":
-            reasons.append("长辈适宜")
-        elif customer_type == "儿童":
-            reasons.append("儿童喜爱")
-        elif customer_type == "聚餐":
-            reasons.append("聚会分享")
-        elif customer_type == "情侣":
-            reasons.append("浪漫温馨")
-    
-    # 天气理由
+        ctx_parts.append(f"人群：{customer_type}")
     if weather:
-        weather_map = {
-            "热天": "清爽解暑",
-            "冷天": "暖身暖心", 
-            "雨天": "驱寒暖胃"
-        }
-        reasons.append(weather_map.get(weather, weather))
-    
-    # 季节理由
+        ctx_parts.append(f"天气：{weather}")
     if season:
-        season_map = {
-            "春": "春意盎然",
-            "夏": "夏日清爽",
-            "秋": "秋补养生",
-            "冬": "冬暖滋补"
+        ctx_parts.append(f"季节：{season}")
+    if membership_level and membership_level != "普通会员":
+        ctx_parts.append(f"会员：{membership_level}")
+    if allergen_avoid:
+        ctx_parts.append(f"过敏避开：{allergen_avoid}")
+    if skipped_by_rules:
+        ctx_parts.append(f"规则避让：已跳过{len(skipped_by_rules)}道冲突菜品")
+    # 品类分布
+    if recommended:
+        cats = list(set(d.category for d in recommended if d.category != "菌汤锅底"))
+        if cats:
+            ctx_parts.append(f"品类覆盖：{'、'.join(cats)}")
+    return "\n".join(ctx_parts)
+
+
+@tool
+def generate_recommendation_reason(
+    dish_names: str,
+    taste: str = "",
+    customer_type: str = "",
+    weather: str = "",
+    season: str = "",
+    allergen_avoid: str = "",
+    people_count: int = 0,
+    membership_level: str = "",
+    skipped_dishes: str = "",
+) -> str:
+    """为已推荐的菜品组合生成口语化、有人情味的推荐理由。
+
+    适用场景：
+    - 顾客问"为什么推荐这些菜？""说说这些菜好在哪？"
+    - 需要在推荐结果之外，额外生成更详细的理由说明
+    - 顾客想看推荐的"门道"
+
+    后续计划：此工具可切换为 LLM 生成或本地知识库检索生成推荐理由。
+
+    Args:
+        dish_names: 推荐的菜品名称列表，多个用逗号分隔
+        taste: 口味偏好
+        customer_type: 人群类型
+        weather: 天气
+        season: 季节
+        allergen_avoid: 已避开的过敏原
+        people_count: 用餐人数
+        membership_level: 会员等级
+        skipped_dishes: 因规则冲突被跳过的菜品名称，多个用逗号分隔
+    """
+    import random
+
+    dishes_list = [d.strip() for d in _parse_csv(dish_names) if d.strip()]
+    skipped_list = [s.strip() for s in _parse_csv(skipped_dishes) if s.strip()]
+
+    if not dishes_list:
+        return "暂无推荐菜品，无法生成理由。"
+
+    # 查找对应的 Dish 对象
+    all_dishes = get_merged_dishes() if callable(get_merged_dishes) else []
+    dish_map = {d.name: d for d in all_dishes}
+    matched = [dish_map[name] for name in dishes_list if name in dish_map]
+
+    parts = []
+
+    # 开场：根据人数和会员等级
+    if people_count and people_count > 0:
+        if membership_level and membership_level != "普通会员":
+            parts.append(f"作为{membership_level}，给{people_count}位客人精心挑选了这些好菜")
+        elif people_count <= 2:
+            parts.append(f"给{people_count}位客人挑了几道精致好菜")
+        elif people_count <= 4:
+            parts.append(f"给{people_count}位客人搭了一桌丰盛搭配")
+        else:
+            parts.append(f"给{people_count}位客人凑了一大桌")
+    else:
+        if membership_level and membership_level != "普通会员":
+            parts.append(f"作为{membership_level}，为您精挑细选了这份搭配")
+        else:
+            parts.append("为您精挑细选了这份搭配")
+
+    # 口味描述
+    if taste:
+        taste_words = {
+            "不辣": "走的是清淡鲜美路线", "微辣": "带点微辣提提味刚刚好",
+            "中辣": "香辣过瘾不会太刺激", "特辣": "辣劲十足吃起来特别爽",
+            "酸辣": "酸辣开胃越吃越想吃", "香辣": "香气扑鼻很有层次",
         }
-        reasons.append(season_map.get(season, season))
-    
-    # 如果没有特定理由，使用默认理由
-    if not reasons:
-        reasons.append("精心搭配")
-    
-    return "、".join(reasons) + "组合"
+        display_taste = taste.split("/")[-1] if "/" in taste else taste
+        parts.append(taste_words.get(display_taste, f"口味上{taste}"))
+
+    # 搭配亮点（从菜品分类提取）
+    if matched:
+        categories = list(set(d.category for d in matched if d.category != "菌汤锅底"))
+        if categories:
+            cat_names = "、".join(categories[:3])
+            parts.append(f"有{cat_names}等多种品类，搭配均衡")
+
+    # 人群适配
+    if customer_type:
+        crowd_words = {
+            "老人": "口味温和，都是长辈爱吃的",
+            "儿童": "有好吃的也有营养的，小朋友肯定开心",
+            "聚餐": "分量够足品类也全，大家一起分享才热闹",
+            "情侣": "份量刚好不浪费，吃着也有情调",
+            "一人食": "每道都精致，一个人也能吃出仪式感",
+        }
+        parts.append(crowd_words.get(customer_type, ""))
+
+    # 天气时令点缀
+    if weather or season:
+        feel = ""
+        if weather:
+            weather_words = {"热天": "天热选了清爽的搭配", "冷天": "天冷来锅暖的", "雨天": "雨天吃火锅最治愈"}
+            feel = weather_words.get(weather, "")
+        if season:
+            season_words = {"春": "春天就吃这一口鲜", "夏": "夏天也不会觉得腻", "秋": "秋天贴贴秋膘", "冬": "冬天暖身又暖心"}
+            feel = season_words.get(season, feel)
+        if feel:
+            parts.append(feel)
+
+    # 规则避让
+    if skipped_list:
+        parts.append(f"还特意帮您避开了{len(skipped_list)}道不太搭的菜，保证这桌不出错")
+
+    # 过敏原
+    if allergen_avoid:
+        parts.append(f"「{allergen_avoid}」过敏的食材都帮您避开了，放心吃~")
+
+    # 结尾
+    parts.append("希望这桌菜能让您吃得开心！")
+
+    # 过滤空值
+    parts = [s for s in parts if s]
+    return "。".join(parts)
 
 
 # 所有工具列表（供 Agent 使用）
@@ -1252,4 +1201,5 @@ ALL_TOOLS = [
     get_pairing_plan,
     get_exclusion_rules,
     get_fruit_allergen_info,
+    generate_recommendation_reason,
 ]

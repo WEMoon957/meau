@@ -225,11 +225,11 @@ app.add_middleware(
     allow_credentials=False,
 )
 
-
 # ======================== 请求/响应模型 ========================
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
-    session_id: str = Field(default="", max_length=64)
+    session_id: str = Field(..., min_length=1, max_length=64)
+    membership_level: str = Field(default="普通会员", max_length=32)
+    user_message: str = Field(..., min_length=1, max_length=2000)
 
 
 class ChatResponse(BaseModel):
@@ -376,7 +376,10 @@ async def ai_chat(request: ChatRequest, http_request: Request):
         async with _chat_semaphore:
             # 无状态 agent + Redis 历史：在线程池中执行（graph.invoke 为同步阻塞调用）
             aimessage = await asyncio.to_thread(
-                manager.chat, session_id, request.message.strip()
+                manager.chat,
+                session_id,
+                request.user_message.strip(),
+                request.membership_level.strip(),
             )
         return {
             "code": 200,
@@ -496,6 +499,21 @@ async def ai_info():
         },
     }
 
+
+# 前端静态文件
+from fastapi.responses import FileResponse
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "..")
+
+
+@app.get("/")
+@app.get("/index.html")
+async def serve_index():
+    """提供前端入口页面"""
+    index_path = os.path.join(_STATIC_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    raise HTTPException(status_code=404, detail="index.html not found")
 
 if __name__ == "__main__":
     import uvicorn
