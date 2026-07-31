@@ -48,5 +48,10 @@ CHAT_RATE_PER_SESSION = int(os.environ.get("CHAT_RATE_PER_SESSION", "30"))
 CHAT_RATE_PER_IP = int(os.environ.get("CHAT_RATE_PER_IP", "60"))
 CHAT_RATE_WINDOW = int(os.environ.get("CHAT_RATE_WINDOW", "60"))
 
+# 会话签发专用限流（防止 token 创建接口被滥用消耗服务端资源）
+SESSION_CREATE_PER_IP = int(os.environ.get("SESSION_CREATE_PER_IP", "10"))
+SESSION_CREATE_WINDOW = int(os.environ.get("SESSION_CREATE_WINDOW", "60"))
+
 session_chat_limiter = FixedWindowRateLimiter(CHAT_RATE_PER_SESSION, CHAT_RATE_WINDOW)
 ip_chat_limiter = FixedWindowRateLimiter(CHAT_RATE_PER_IP, CHAT_RATE_WINDOW)
+session_create_limiter = FixedWindowRateLimiter(SESSION_CREATE_PER_IP, SESSION_CREATE_WINDOW)

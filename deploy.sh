@@ -51,6 +51,9 @@ pip install -r requirements.txt
 
 echo "[6/6] 初始化数据库和配置..."
 
+# 生成会话 token 签名密钥（HMAC-SHA256）
+SESSION_SECRET=$(openssl rand -hex 32)
+
 cat > ${APP_DIR}/.env <<EOF
 OPENAI_API_KEY=${API_KEY}
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -61,6 +64,8 @@ DB_PORT=3306
 DB_USER=menu_user
 DB_PASSWORD=${DB_PASSWORD}
 DB_NAME=restaurant
+SESSION_SECRET=${SESSION_SECRET}
+SESSION_TOKEN_TTL=86400
 SESSION_TTL_SECONDS=1800
 SESSION_CLEANUP_INTERVAL=300
 MAX_SESSIONS=500
@@ -68,6 +73,8 @@ MAX_CONCURRENT_CHATS=20
 CHAT_RATE_PER_SESSION=30
 CHAT_RATE_PER_IP=60
 CHAT_RATE_WINDOW=60
+SESSION_CREATE_PER_IP=10
+SESSION_CREATE_WINDOW=60
 EOF
 
 cd ${APP_DIR}/main
@@ -134,3 +141,6 @@ echo "1. 在阿里云安全组放行 80 端口（入方向）"
 echo "2. 查看日志: journalctl -u ${APP_NAME} -f"
 echo "3. 重启服务: systemctl restart ${APP_NAME}"
 echo "4. 配置 HTTPS（可选）: certbot --nginx"
+echo ""
+echo "⚠️ 注意: SESSION_SECRET 已自动生成并写入 ${APP_DIR}/.env"
+echo "   重新运行本脚本会重新生成密钥，导致所有已签发会话 token 失效。"
