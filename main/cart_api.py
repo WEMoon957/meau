@@ -194,59 +194,134 @@ def _build_biz_content(req: CartAddRequest) -> dict:
 
 
 # ======================== 主入口：加入购物车 ========================
-async def add_to_cart(req: CartAddRequest) -> CartAddResponse:
-    """加入购物车：构造请求 → RSA2 签名 → 调用收钱吧网关 → 返回结果"""
-    if not SQB_APP_ID:
-        raise HTTPException(status_code=500, detail="未配置 SQB_APP_ID")
+# ======================== 主入口：加入购物车 ========================
+# method 候选列表：依次尝试，第一个成功的就用
+# 文档里 method 示例与 #url 段不一致，故枚举几种可能
+_METHOD_CANDIDATES = [
+    "openapi.applet.cart.increaseItemsShopCartApi",  # 从 #url 推断
+    "openapi.applet.card.openCardApi",                # 文档示例（疑似复制错误）
+    "applet.cart.increaseItemsShopCartApi",           # 去前缀
+    "increaseItemsShopCartApi",                       # 纯方法名
+    "openapi.applet.cart.add",                         # 简化名
+]
 
-    biz_content = _build_biz_content(req)
-    biz_json = json.dumps(biz_content, ensure_ascii=False, separators=(",", ":"))
+# 是否同时尝试"方法路径放 URL 里"的模式
+_TRY_URL_PATH = True
 
-    # 外层公共参数（不含 sign）
-    common = {
-        "appId": SQB_APP_ID,
-        "format": "json",
-        "charset": "UTF-8",
-        "signType": "RSA2",
-        "timestamp": str(int(time.time() * 1000)),
-        "version": SQB_VERSION,
-        "method": SQB_METHOD,
-        "bizContent": biz_json,
-    }
 
-    # 生成签名
-    sign = _build_sign(common)
-    common["sign"] = sign
-
-    logger.info(
-        "[cart] 加购请求 shopId=%s goodsId=%s skuId=%s num=%s",
-        req.shopId, req.goodsId, req.skuId, req.goodsNum,
-    )
-
-    # 调用收钱吧网关
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(SQB_GATEWAY_URL, data=common)
-    except httpx.HTTPError as e:
-        logger.error("[cart] 调用收钱吧网关失败: %s", e)
-        raise HTTPException(status_code=502, detail="收钱吧网关调用失败")
-
-    if resp.status_code != 200:
-        logger.error("[cart] 网关 HTTP %s: %s", resp.status_code, resp.text[:500])
-        raise HTTPException(status_code=502, detail=f"收钱吧网关返回 HTTP {resp.status_code}")
-
+async def _call_gateway(client, url, payload):
+    """单次调用收钱吧网关，返回 (status_code, json_result, raw_text)"""
+    resp = await client.post(url, data=payload)
     try:
         result = resp.json()
     except Exception:
-        raise HTTPException(status_code=502, detail="收钱吧返回非 JSON")
+        result = None
+    return resp.status_code, result, resp.text[:500] if resp.text else ""
 
-    # 收钱吧返回结构通常含 code/msg/data
+
+def _is_success(result):
+    """判断收钱吧返回是否成功"""
+    if not result:
+        return False
+    code = result.get("code")
+    return code in (0, "0", 200, "200", "SUCCESS", "success")
+
+
+def _parse_result(result, raw_text):
+    """解析收钱吧返回，构造 CartAddResponse"""
+    if not result:
+        return CartAddResponse(code=502, msg="收钱吧返回非 JSON", data={"raw": raw_text})
     code = result.get("code")
     msg = result.get("msg") or result.get("message") or ""
-    if code in (0, "0", 200, "200", "SUCCESS", "success"):
+    if _is_success(result):
         return CartAddResponse(code=200, msg="success", data=result.get("data") or result)
     return CartAddResponse(
         code=int(code) if str(code).isdigit() else 500,
         msg=str(msg),
         data=result,
     )
+
+
+async def add_to_cart(req: CartAddRequest) -> CartAddResponse:
+    """加入购物车：构造请求 → RSA2 签名 → 调用收钱吧网关 → 返回结果
+
+    由于文档里 method 字符串不明确，这里依次尝试候选 method，
+    第一个返回成功的就用；全部失败则返回最后一次的结果。
+    """
+    if not SQB_APP_ID:
+        raise HTTPException(status_code=500, detail="未配置 SQB_APP_ID")
+
+    biz_content = _build_biz_content(req)
+    biz_json = json.dumps(biz_content, ensure_ascii=False, separators=(",", ":"))
+
+    logger.info(
+        "[cart] 加购请求 shopId=%s goodsId=%s skuId=%s num=%s",
+        req.shopId, req.goodsId, req.skuId, req.goodsNum,
+    )
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        last_resp = None
+        # 模式 A：method 在 body 里，依次尝试候选值
+        for method in _METHOD_CANDIDATES:
+            common = {
+                "appId": SQB_APP_ID,
+                "format": "json",
+                "charset": "UTF-8",
+                "signType": "RSA2",
+                "timestamp": str(int(time.time() * 1000)),
+                "version": SQB_VERSION,
+                "method": method,
+                "bizContent": biz_json,
+            }
+            common["sign"] = _build_sign(common)
+
+            try:
+                status, result, raw = await _call_gateway(client, SQB_GATEWAY_URL, common)
+            except httpx.HTTPError as e:
+                logger.error("[cart] 网关调用失败 method=%s: %s", method, e)
+                last_resp = CartAddResponse(code=502, msg="收钱吧网关调用失败", data={"method": method})
+                continue
+
+            logger.info("[cart] method=%s -> HTTP %s, code=%s, msg=%s",
+                        method, status,
+                        result.get("code") if result else None,
+                        result.get("msg") if result else None)
+
+            if status == 200 and _is_success(result):
+                logger.info("[cart] ✅ 成功 method=%s", method)
+                return _parse_result(result, raw)
+
+            last_resp = _parse_result(result, raw)
+            # 1300 = 接口不存在，继续试下一个；其他错误也继续试
+            last_resp.data = {**(last_resp.data or {}), "tried_method": method}
+
+        # 模式 B：方法路径放 URL 里，不带 method 字段
+        if _TRY_URL_PATH:
+            url_path = f"{SQB_GATEWAY_URL}/applet/cart/increaseItemsShopCartApi"
+            common = {
+                "appId": SQB_APP_ID,
+                "format": "json",
+                "charset": "UTF-8",
+                "signType": "RSA2",
+                "timestamp": str(int(time.time() * 1000)),
+                "version": SQB_VERSION,
+                "bizContent": biz_json,
+            }
+            common["sign"] = _build_sign(common)
+            try:
+                status, result, raw = await _call_gateway(client, url_path, common)
+                logger.info("[cart] url_path=%s -> HTTP %s, code=%s",
+                            url_path, status,
+                            result.get("code") if result else None)
+                if status == 200 and _is_success(result):
+                    logger.info("[cart] ✅ 成功 url_path=%s", url_path)
+                    return _parse_result(result, raw)
+                last_resp = _parse_result(result, raw)
+                last_resp.data = {**(last_resp.data or {}), "tried_url_path": url_path}
+            except httpx.HTTPError as e:
+                logger.error("[cart] url_path 调用失败: %s", e)
+
+    # 全部失败，返回最后一次结果
+    if last_resp is None:
+        last_resp = CartAddResponse(code=500, msg="所有 method 候选均失败", data=None)
+    return last_resp
