@@ -48,10 +48,10 @@ _pool: Optional[PooledDB] = None
 
 
 def _get_pool() -> PooledDB:
-    """懒加载连接池。
+    """返回连接池（模块加载时已创建，懒加载保留为兜底）。
 
-    懒加载原因：gunicorn preload_app=True 时模块在 master 进程导入，
-    若此时建池会被 fork 的子进程共享连接（MySQL 协议不允许），故推迟到首次使用。
+    说明：gunicorn preload_app=False（当前配置）时每个 worker 独立导入模块，
+    在导入时即建池是 fork 安全的；若改回 preload_app=True 需恢复纯懒加载。
     """
     global _pool
     if _pool is None:
@@ -67,6 +67,10 @@ def _get_pool() -> PooledDB:
             **DB_CONFIG,
         )
     return _pool
+
+
+# 模块加载时即创建连接池，确保数据库连接一直开启（eager 初始化）
+_get_pool()
 
 
 def get_connection():

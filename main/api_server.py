@@ -500,6 +500,22 @@ async def ai_info():
     }
 
 
+# ======================== 购物车代理接口（独立模块，不动现有代码） ========================
+# 全来店（收钱吧）加购代理：前端调 /api/cart/add，后端完成 RSA2 签名后转发
+# 详细实现见 main/cart_api.py
+from cart_api import CartAddRequest as _CartAddRequest, CartAddResponse as _CartAddResponse, add_to_cart as _add_to_cart  # noqa: E402
+
+
+@app.post("/api/cart/add", response_model=_CartAddResponse)
+async def cart_add(request: _CartAddRequest):
+    """加入购物车 - 代理调用收钱吧 openApi（RSA2 签名在后端完成）
+
+    前端只需传简化字段，后端补全为收钱吧完整格式并签名后转发。
+    私钥只在后端，前端无需持有密钥。
+    """
+    return await _add_to_cart(request)
+
+
 # 前端静态文件
 from fastapi.responses import FileResponse
 

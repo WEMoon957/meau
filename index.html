@@ -46,6 +46,7 @@
             transition: background 0.2s;
         }
         .header .reset-btn:hover { background: rgba(255,255,255,0.35); }
+
         .chat-area {
             flex: 1;
             padding: 20px 24px;
@@ -82,29 +83,92 @@
         .msg.assistant .bubble .r-tip { margin-top: 10px; font-size: 12px; color: #999; text-align: center; }
         .msg.assistant .bubble .r-text { font-size: 14px; line-height: 1.7; white-space: pre-wrap; }
         .empty { text-align: center; color: #999; font-size: 13px; padding: 20px; }
-        .input-bar {
-            display: flex;
-            gap: 10px;
-            padding: 16px 24px;
-            border-top: 1px solid #eef0f4;
-            background: #fff;
+
+        /* ===== 按键式交互面板 ===== */
+        .panel {
             flex-shrink: 0;
+            background: #fff;
+            border-top: 1px solid #eef0f4;
         }
-        .input-bar textarea {
+        .progress {
+            display: flex;
+            padding: 12px 24px 0;
+            gap: 6px;
+        }
+        .progress .step {
             flex: 1;
-            min-height: 60px;
-            max-height: 120px;
-            padding: 10px 12px;
+            height: 4px;
+            border-radius: 2px;
+            background: #eef0f4;
+            transition: background 0.25s;
+        }
+        .progress .step.active { background: #667eea; }
+        .progress .step.done { background: #a5b0e8; }
+
+        .panel-body {
+            padding: 14px 24px 8px;
+        }
+        .panel-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 4px;
+        }
+        .panel-sub {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 12px;
+        }
+        .panel-sub .sel { color: #667eea; font-weight: 500; }
+
+        .btn-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .btn-grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
+        .btn-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+
+        .opt-btn {
+            padding: 10px 6px;
             border: 1px solid #dde1e7;
+            background: #fff;
             border-radius: 8px;
             font-size: 14px;
-            font-family: inherit;
-            resize: none;
-            outline: none;
+            color: #333;
+            cursor: pointer;
+            transition: all 0.18s;
+            text-align: center;
+            user-select: none;
         }
-        .input-bar textarea:focus { border-color: #667eea; }
-        .input-bar button {
-            padding: 0 22px;
+        .opt-btn:hover { border-color: #667eea; color: #667eea; }
+        .opt-btn.selected {
+            background: #667eea;
+            border-color: #667eea;
+            color: #fff;
+        }
+        .opt-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .panel-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 24px 16px;
+        }
+        .link-btn {
+            background: none;
+            border: none;
+            color: #999;
+            font-size: 13px;
+            cursor: pointer;
+            padding: 6px 4px;
+        }
+        .link-btn:hover { color: #667eea; }
+        .link-btn:disabled { color: #ccc; cursor: not-allowed; }
+
+        .primary-btn {
+            padding: 9px 22px;
             background: #667eea;
             color: #fff;
             border: none;
@@ -114,8 +178,35 @@
             cursor: pointer;
             transition: background 0.2s;
         }
-        .input-bar button:hover { background: #5568d3; }
-        .input-bar button:disabled { background: #b8bfd1; cursor: not-allowed; }
+        .primary-btn:hover { background: #5568d3; }
+        .primary-btn:disabled { background: #b8bfd1; cursor: not-allowed; }
+
+        .summary-bar {
+            padding: 8px 24px;
+            background: #f5f7fa;
+            border-top: 1px solid #eef0f4;
+            font-size: 12px;
+            color: #666;
+            min-height: 32px;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .summary-bar .tag {
+            background: #fff;
+            border: 1px solid #e0e4ec;
+            border-radius: 10px;
+            padding: 2px 8px;
+            color: #555;
+        }
+        .summary-bar .tag .x {
+            color: #999;
+            cursor: pointer;
+            margin-left: 4px;
+        }
+        .summary-bar .tag .x:hover { color: #e74c3c; }
+        .summary-bar .placeholder { color: #aaa; }
     </style>
 </head>
 <body>
@@ -123,31 +214,50 @@
         <div class="header">
             <div>
                 <h1>AI 菜单推荐</h1>
-                <p>输入你想吃的内容，AI 会推荐相关菜品</p>
+                <p>按步骤选择偏好，AI 为你定制推荐</p>
             </div>
-            <button class="reset-btn" onclick="resetChat()" title="重置对话">新对话</button>
+            <button class="reset-btn" onclick="resetAll()" title="重新开始">重新开始</button>
         </div>
 
         <div class="chat-area" id="chatArea">
-            <div class="empty">暂无消息，开始聊天吧</div>
+            <div class="empty">选择下方选项，开始定制你的菜单</div>
         </div>
 
-        <div class="input-bar">
-            <textarea id="messageInput" placeholder="输入消息，例如：我们X个人，不爱/爱吃辣，有小孩..."></textarea>
-            <button id="sendBtn">发送</button>
+        <div class="panel">
+            <div class="progress">
+                <div class="step active" id="step-bar-1"></div>
+                <div class="step" id="step-bar-2"></div>
+                <div class="step" id="step-bar-3"></div>
+            </div>
+
+            <div class="panel-body" id="panelBody">
+                <!-- 动态渲染 -->
+            </div>
+
+            <div class="panel-actions">
+                <button class="link-btn" id="prevBtn" onclick="prevStep()">上一步</button>
+                <button class="primary-btn" id="nextBtn" onclick="nextStep()">下一步</button>
+            </div>
+
+            <div class="summary-bar" id="summaryBar">
+                <span class="placeholder">尚未选择任何项</span>
+            </div>
         </div>
     </div>
 
     <script>
-        const messageInput = document.getElementById('messageInput');
-        const sendBtn = document.getElementById('sendBtn');
         const chatArea = document.getElementById('chatArea');
+        const panelBody = document.getElementById('panelBody');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const summaryBar = document.getElementById('summaryBar');
 
-        // ========== 修改：后端 API 地址 ==========
-        const API_URL = 'http://127.0.0.1:3000/api/ai/chat';
-        const RESET_URL = 'http://127.0.0.1:3000/api/ai/reset';
+        // ========== 后端 API 地址 ==========
+        // 使用相对路径，与后端同源（前端由 FastAPI 3000 端口提供），
+        // 局域网/本地/任何主机名访问都能正常工作，无需修改。
+        const API_URL = '/api/ai/chat';
+        const RESET_URL = '/api/ai/reset';
 
-        // ========== 关键：保存 session_id 用于连续对话 ==========
         function generateUUID() {
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
                 const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -156,12 +266,35 @@
         }
         let sessionId = generateUUID();
 
+        // ========== 选项配置 ==========
+        const PEOPLE_OPTIONS = ['1人', '2人', '3人', '4人', '5人', '6人', '7人', '8人', '9人', '10人+'];
+        const SPICY_OPTIONS = [
+            { label: '不吃辣', value: '不吃辣' },
+            { label: '微辣', value: '微辣' },
+            { label: '中辣', value: '中辣' },
+            { label: '特辣', value: '特辣' }
+        ];
+        const PREF_OPTIONS = [
+            '有小孩', '有老人', '有素食者', '清淡口味', '下饭',
+            '招牌菜', '不要香菜', '不要葱蒜', '海鲜过敏', '花生过敏'
+        ];
+
+        // ========== 状态 ==========
+        const state = {
+            step: 1,           // 1: 人数, 2: 辣度, 3: 偏好
+            people: '',        // 单选
+            spicy: '',         // 单选
+            prefs: new Set(),  // 多选
+            submitted: false
+        };
+
         function escapeHtml(s) {
             return String(s).replace(/[&<>"']/g, c => ({
                 '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
             }[c]));
         }
 
+        // ========== 助手回复格式化（沿用旧逻辑） ==========
         function formatAssistantHtml(text) {
             const lines = text.split('\n');
             const html = [];
@@ -177,7 +310,6 @@
             for (; i < lines.length; i++) {
                 const line = lines[i];
                 const trimmed = line.trim();
-
                 if (!trimmed) continue;
 
                 if (!parsed && /警告|提示|无法|没有合适/.test(trimmed) && !trimmed.startsWith('---')) {
@@ -217,31 +349,12 @@
                     continue;
                 }
 
-                if (/^合计：/.test(trimmed)) {
-                    html.push(`<div class="r-total">${escapeHtml(trimmed)}</div>`);
-                    continue;
-                }
+                if (/^合计：/.test(trimmed)) { html.push(`<div class="r-total">${escapeHtml(trimmed)}</div>`); continue; }
+                if (/^推荐理由：/.test(trimmed)) { html.push(`<div class="r-reason">${escapeHtml(trimmed)}</div>`); continue; }
+                if (/(冲突|互斥|不宜搭配|搭配规则|警告)/.test(trimmed)) { html.push(`<div class="r-rule">${escapeHtml(trimmed)}</div>`); continue; }
+                if (/如需调整|请告诉我/.test(trimmed)) { html.push(`<div class="r-tip">${escapeHtml(trimmed)}</div>`); continue; }
 
-                if (/^推荐理由：/.test(trimmed)) {
-                    html.push(`<div class="r-reason">${escapeHtml(trimmed)}</div>`);
-                    continue;
-                }
-
-                if (/(冲突|互斥|不宜搭配|搭配规则|警告)/.test(trimmed)) {
-                    html.push(`<div class="r-rule">${escapeHtml(trimmed)}</div>`);
-                    continue;
-                }
-
-                if (/如需调整|请告诉我/.test(trimmed)) {
-                    html.push(`<div class="r-tip">${escapeHtml(trimmed)}</div>`);
-                    continue;
-                }
-
-                if (parsed) {
-                    html.push(`<div class="r-text">${escapeHtml(trimmed)}</div>`);
-                } else {
-                    html.push(`<div class="r-text">${escapeHtml(line)}</div>`);
-                }
+                html.push(`<div class="r-text">${escapeHtml(trimmed)}</div>`);
             }
 
             if (!parsed && html.length === 0) {
@@ -268,43 +381,181 @@
             return bubble;
         }
 
-        async function sendMessage() {
-            const text = messageInput.value.trim();
-            if (!text) return;
+        // ========== 步骤渲染 ==========
+        function renderStep() {
+            updateProgressBar();
+            updateSummary();
+            if (state.submitted) {
+                panelBody.innerHTML = `
+                    <div class="panel-title">已生成推荐</div>
+                    <div class="panel-sub">如需调整，点击"重新开始"或修改选项后再次推荐</div>
+                `;
+                prevBtn.disabled = false;
+                prevBtn.textContent = '修改选项';
+                nextBtn.disabled = false;
+                nextBtn.textContent = '再次推荐';
+                return;
+            }
 
-            appendMessage('user', text);
-            messageInput.value = '';
-            sendBtn.disabled = true;
-            sendBtn.textContent = '发送中...';
-            const loadingBubble = appendMessage('loading', '正在思考...');
+            prevBtn.disabled = state.step === 1;
+            prevBtn.textContent = '上一步';
+
+            if (state.step === 1) {
+                nextBtn.textContent = state.people ? '下一步' : '请先选择';
+                nextBtn.disabled = !state.people;
+                panelBody.innerHTML = `
+                    <div class="panel-title">第 1 步：用餐人数</div>
+                    <div class="panel-sub">选择当前用餐的人数</div>
+                    <div class="btn-grid" id="peopleGrid"></div>
+                `;
+                const grid = document.getElementById('peopleGrid');
+                PEOPLE_OPTIONS.forEach(opt => {
+                    const b = document.createElement('button');
+                    b.className = 'opt-btn' + (state.people === opt ? ' selected' : '');
+                    b.textContent = opt;
+                    b.onclick = () => { state.people = opt; renderStep(); };
+                    grid.appendChild(b);
+                });
+            } else if (state.step === 2) {
+                nextBtn.textContent = state.spicy ? '下一步' : '请先选择';
+                nextBtn.disabled = !state.spicy;
+                panelBody.innerHTML = `
+                    <div class="panel-title">第 2 步：辣度偏好</div>
+                    <div class="panel-sub">选择你能接受的辣度</div>
+                    <div class="btn-grid cols-4" id="spicyGrid"></div>
+                `;
+                const grid = document.getElementById('spicyGrid');
+                SPICY_OPTIONS.forEach(opt => {
+                    const b = document.createElement('button');
+                    b.className = 'opt-btn' + (state.spicy === opt.value ? ' selected' : '');
+                    b.textContent = opt.label;
+                    b.onclick = () => { state.spicy = opt.value; renderStep(); };
+                    grid.appendChild(b);
+                });
+            } else if (state.step === 3) {
+                nextBtn.textContent = '生成推荐';
+                nextBtn.disabled = false;
+                panelBody.innerHTML = `
+                    <div class="panel-title">第 3 步：其他偏好</div>
+                    <div class="panel-sub">可多选，也可跳过</div>
+                    <div class="btn-grid cols-5" id="prefGrid"></div>
+                `;
+                const grid = document.getElementById('prefGrid');
+                PREF_OPTIONS.forEach(opt => {
+                    const b = document.createElement('button');
+                    b.className = 'opt-btn' + (state.prefs.has(opt) ? ' selected' : '');
+                    b.textContent = opt;
+                    b.onclick = () => {
+                        if (state.prefs.has(opt)) state.prefs.delete(opt);
+                        else state.prefs.add(opt);
+                        renderStep();
+                    };
+                    grid.appendChild(b);
+                });
+            }
+        }
+
+        function updateProgressBar() {
+            [1, 2, 3].forEach(i => {
+                const el = document.getElementById('step-bar-' + i);
+                el.classList.remove('active', 'done');
+                if (state.submitted || i < state.step) el.classList.add('done');
+                else if (i === state.step) el.classList.add('active');
+            });
+        }
+
+        function updateSummary() {
+            const tags = [];
+            if (state.people) tags.push({ key: 'people', label: state.people });
+            if (state.spicy) tags.push({ key: 'spicy', label: state.spicy });
+            state.prefs.forEach(p => tags.push({ key: 'pref:' + p, label: p }));
+
+            if (tags.length === 0) {
+                summaryBar.innerHTML = '<span class="placeholder">尚未选择任何项</span>';
+                return;
+            }
+            summaryBar.innerHTML = tags.map(t =>
+                `<span class="tag">${escapeHtml(t.label)}<span class="x" data-key="${escapeHtml(t.key)}">×</span></span>`
+            ).join('');
+            summaryBar.querySelectorAll('.tag .x').forEach(x => {
+                x.onclick = (e) => {
+                    const key = e.target.getAttribute('data-key');
+                    removeTag(key);
+                };
+            });
+        }
+
+        function removeTag(key) {
+            if (key === 'people') state.people = '';
+            else if (key === 'spicy') state.spicy = '';
+            else if (key.startsWith('pref:')) state.prefs.delete(key.slice(5));
+            renderStep();
+        }
+
+        function nextStep() {
+            if (state.submitted) {
+                // 再次推荐
+                state.submitted = false;
+                renderStep();
+                submitRecommend();
+                return;
+            }
+            if (state.step === 1 && !state.people) return;
+            if (state.step === 2 && !state.spicy) return;
+            if (state.step < 3) {
+                state.step++;
+                renderStep();
+            } else {
+                submitRecommend();
+            }
+        }
+
+        function prevStep() {
+            if (state.submitted) {
+                state.submitted = false;
+                renderStep();
+                return;
+            }
+            if (state.step > 1) {
+                state.step--;
+                renderStep();
+            }
+        }
+
+        // ========== 组装消息并提交 ==========
+        function buildMessage() {
+            const parts = [];
+            if (state.people) parts.push('我们' + state.people);
+            if (state.spicy) parts.push(state.spicy);
+            if (state.prefs.size > 0) parts.push([...state.prefs].join('、'));
+            parts.push('请推荐合适的菜品');
+            return parts.join('，');
+        }
+
+        async function submitRecommend() {
+            const message = buildMessage();
+            appendMessage('user', message);
+
+            state.submitted = true;
+            renderStep();
+
+            const loadingBubble = appendMessage('loading', '正在为你定制推荐...');
 
             try {
                 const resp = await fetch(API_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    // ========== 关键：始终带上 session_id ==========
-                    body: JSON.stringify({ user_message: text, session_id: sessionId })
+                    body: JSON.stringify({ user_message: message, session_id: sessionId })
                 });
-
                 if (!resp.ok) {
                     const errText = await resp.text().catch(() => '无错误详情');
                     throw new Error(`请求失败 (HTTP ${resp.status})：${errText}`);
                 }
-
                 const data = await resp.json();
-                // ========== 关键：保存后端返回的 session_id ==========
-                if (data.session_id) {
-                    sessionId = data.session_id;
-                }
-
+                if (data.session_id) sessionId = data.session_id;
                 const content =
-                    data.aimessage ||
-                    data.content ||
-                    data.message ||
-                    data.reply ||
-                    data.result ||
-                    JSON.stringify(data);
-
+                    data.aimessage || data.content || data.message ||
+                    data.reply || data.result || JSON.stringify(data);
                 loadingBubble.innerHTML = formatAssistantHtml(String(content));
                 loadingBubble.parentElement.classList.remove('loading');
                 loadingBubble.parentElement.classList.add('assistant');
@@ -316,39 +567,29 @@
                 loadingBubble.textContent = errMsg;
                 loadingBubble.parentElement.classList.remove('loading');
                 loadingBubble.parentElement.classList.add('error');
-            } finally {
-                sendBtn.disabled = false;
-                sendBtn.textContent = '发送';
             }
         }
 
-        // ========== 新增：重置对话 ==========
-        async function resetChat() {
-            if (!sessionId) {
-                chatArea.innerHTML = '<div class="empty">暂无消息，开始聊天吧</div>';
-                return;
-            }
+        async function resetAll() {
             try {
                 await fetch(RESET_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ session_id: sessionId })
                 });
-            } catch (e) {
-                // 静默失败，前端也清空
-            }
-            // 清空前端的 sessionId 和聊天区域
-            sessionId = '';
-            chatArea.innerHTML = '<div class="empty">暂无消息，开始聊天吧</div>';
+            } catch (e) { /* 静默失败 */ }
+            sessionId = generateUUID();
+            state.step = 1;
+            state.people = '';
+            state.spicy = '';
+            state.prefs.clear();
+            state.submitted = false;
+            chatArea.innerHTML = '<div class="empty">选择下方选项，开始定制你的菜单</div>';
+            renderStep();
         }
 
-        sendBtn.addEventListener('click', sendMessage);
-        messageInput.addEventListener('keydown', e => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendMessage();
-            }
-        });
+        // 初始化
+        renderStep();
     </script>
 </body>
 </html>
