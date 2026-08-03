@@ -160,8 +160,11 @@ def _build_sign(params: dict) -> str:
     filtered = {k: v for k, v in params.items() if v not in (None, "", [])}
     sorted_keys = sorted(filtered.keys())
     string_a = "&".join(f"{k}={filtered[k]}" for k in sorted_keys)
-    logger.debug("stringA: %s", string_a)
-    return _rsa2_sign(string_a)
+    # 调试用：完整打印 stringA 与签名结果，方便对接人核对签名规则
+    logger.info("stringA: %s", string_a)
+    sig = _rsa2_sign(string_a)
+    logger.info("sign(len=%d): %s...", len(sig), sig[:50])
+    return sig
 
 
 # ======================== 构造 bizContent ========================
