@@ -14,6 +14,7 @@
 import asyncio
 import json
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -29,6 +30,16 @@ MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "500"))
 # 单会话并发锁超时（秒）：>= LLM_REQUEST_TIMEOUT + 工具执行余量。
 # 持有锁的请求崩溃时，TTL 到期自动释放，避免会话被永久锁死。
 SESSION_LOCK_TIMEOUT = int(os.environ.get("SESSION_LOCK_TIMEOUT", "45"))
+
+# session_token 长度（字节），hex 编码后 64 字符
+SESSION_TOKEN_BYTES = 32
+
+
+class SessionAuthError(Exception):
+    """会话鉴权失败（session_token 缺失或不匹配）。
+
+    由 API 层映射为 401，区别于 SessionBusyError（429）。
+    """
 
 
 class SessionBusyError(Exception):
@@ -95,9 +106,53 @@ class SessionManager:
         # 内存回退模式专用
         self._mem: dict[str, list] = {}
         self._mem_access: dict[str, float] = {}
+        self._mem_tokens: dict[str, str] = {}
         # 内存模式下的每会话锁（Redis 模式使用 Redis 分布式锁）
         self._mem_locks: dict[str, threading.Lock] = {}
         self._mem_locks_guard = threading.Lock()
+
+    # ---------- session_token 签发/校验/销毁 ----------
+    def _token_key(self, session_id: str) -> str:
+        return f"menu:session:token:{session_id}"
+
+    def issue_token(self, session_id: str) -> str:
+        """为会话签发 token 并持久化。会话首次创建时调用。
+
+        若该会话已有 token，覆盖重签（用于 session 被劫持后强制重置场景）。
+        """
+        token = secrets.token_hex(SESSION_TOKEN_BYTES)
+        if self.redis is not None:
+            self.redis.setex(self._token_key(session_id), SESSION_TTL_SECONDS, token)
+        else:
+            self._mem_tokens[session_id] = token
+        return token
+
+    def verify_token(self, session_id: str, token: str) -> bool:
+        """校验 session_token 是否匹配（常数时间比较，防时序攻击）。
+
+        Returns:
+            True 表示 token 与已签发凭证匹配；False 表示凭证缺失/会话不存在/不匹配。
+            新会话的签发统一走 issue_token（由 _verify_session_access 在 session_id 为空时调用），
+            此处不再对 stored is None 放行——否则攻击者可伪造任意 session_id 绕过 cart/reset 鉴权。
+        """
+        if not token:
+            return False
+        if self.redis is not None:
+            stored = self.redis.get(self._token_key(session_id))
+        else:
+            stored = self._mem_tokens.get(session_id)
+        # 会话无已签发 token：视为无效（防止伪造 session_id 绕过对象级鉴权）
+        if stored is None:
+            return False
+        if not isinstance(stored, str):
+            stored = stored.decode("utf-8") if isinstance(stored, (bytes, bytearray)) else str(stored)
+        return secrets.compare_digest(stored, token)
+
+    def _delete_token(self, session_id: str) -> None:
+        if self.redis is not None:
+            self.redis.delete(self._token_key(session_id))
+        else:
+            self._mem_tokens.pop(session_id, None)
 
     # ---------- 核心对话 ----------
     def chat(self, session_id: str, user_input: str, membership_level: str = "") -> str:
@@ -118,8 +173,9 @@ class SessionManager:
             self._release_lock(session_id, lock_token)
 
     def reset(self, session_id: str) -> None:
-        """清空指定会话历史。"""
+        """清空指定会话历史与 token。"""
         self._delete_history(session_id)
+        self._delete_token(session_id)
 
     # ---------- 会话并发锁 ----------
     def _lock_key(self, session_id: str) -> str:
@@ -201,9 +257,11 @@ class SessionManager:
         if self.redis is not None:
             self.redis.delete(self._key(session_id))
             self.redis.srem(_SESSION_INDEX_KEY, session_id)
+            self.redis.delete(self._token_key(session_id))
             return
         self._mem.pop(session_id, None)
         self._mem_access.pop(session_id, None)
+        self._mem_tokens.pop(session_id, None)
         with self._mem_locks_guard:
             self._mem_locks.pop(session_id, None)
 
@@ -233,6 +291,7 @@ class SessionManager:
         for sid in expired:
             self._mem.pop(sid, None)
             self._mem_access.pop(sid, None)
+            self._mem_tokens.pop(sid, None)
         if expired:
             with self._mem_locks_guard:
                 for sid in expired:
@@ -248,14 +307,17 @@ class SessionManager:
     def clear(self) -> None:
         """进程退出时调用（优雅关停）。"""
         if self.redis is not None:
-            # 仅清本服务管理的会话键，不触碰其它命名空间
+            # 仅清本服务管理的会话键与 token，不触碰其它命名空间
             members = self.redis.smembers(_SESSION_INDEX_KEY) or []
-            keys = [self._key(sid) for sid in members] + [_SESSION_INDEX_KEY]
+            keys = [self._key(sid) for sid in members] + \
+                   [self._token_key(sid) for sid in members] + \
+                   [_SESSION_INDEX_KEY]
             if keys:
                 self.redis.delete(*keys)
             return
         self._mem.clear()
         self._mem_access.clear()
+        self._mem_tokens.clear()
         with self._mem_locks_guard:
             self._mem_locks.clear()
 

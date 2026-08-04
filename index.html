@@ -264,7 +264,11 @@
                 return v.toString(16);
             });
         }
-        let sessionId = generateUUID();
+        // 会话凭证：session_id 与 session_token 均由后端签发（首次 chat 时返回）。
+        // 前端不再自行生成 session_id，避免后端无法校验 token（C3 会话对象级鉴权）。
+        // 401 时清空凭证，下一次 chat 自动创建新会话。
+        let sessionId = '';
+        let sessionToken = '';
 
         // ========== 选项配置 ==========
         const PEOPLE_OPTIONS = ['1人', '2人', '3人', '4人', '5人', '6人', '7人', '8人', '9人', '10人+'];
@@ -545,14 +549,26 @@
                 const resp = await fetch(API_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_message: message, session_id: sessionId })
+                    body: JSON.stringify({
+                        user_message: message,
+                        session_id: sessionId,
+                        session_token: sessionToken
+                    })
                 });
+                if (resp.status === 401) {
+                    // 会话凭证失效（过期/被重置）：清空凭证，下一次 chat 自动创建新会话
+                    sessionId = '';
+                    sessionToken = '';
+                    throw new Error('会话已过期，请重新选择并推荐');
+                }
                 if (!resp.ok) {
                     const errText = await resp.text().catch(() => '无错误详情');
                     throw new Error(`请求失败 (HTTP ${resp.status})：${errText}`);
                 }
                 const data = await resp.json();
                 if (data.session_id) sessionId = data.session_id;
+                // 新会话时后端返回 session_token；已有会话返回空（沿用旧 token）
+                if (data.session_token) sessionToken = data.session_token;
                 const content =
                     data.aimessage || data.content || data.message ||
                     data.reply || data.result || JSON.stringify(data);
@@ -571,14 +587,22 @@
         }
 
         async function resetAll() {
-            try {
-                await fetch(RESET_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ session_id: sessionId })
-                });
-            } catch (e) { /* 静默失败 */ }
-            sessionId = generateUUID();
+            // 仅当存在已签发会话时才调用后端 reset（reset 要求 session_id + session_token）
+            if (sessionId && sessionToken) {
+                try {
+                    await fetch(RESET_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_id: sessionId,
+                            session_token: sessionToken
+                        })
+                    });
+                } catch (e) { /* 静默失败 */ }
+            }
+            // 清空凭证：下一次 chat 由后端重新签发新会话与新 token
+            sessionId = '';
+            sessionToken = '';
             state.step = 1;
             state.people = '';
             state.spicy = '';

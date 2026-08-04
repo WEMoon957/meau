@@ -72,10 +72,14 @@ from rate_limiter import (
     CHAT_RATE_PER_IP,
     CHAT_RATE_PER_SESSION,
     CHAT_RATE_WINDOW,
+    CART_RATE_PER_IP,
+    CART_RATE_PER_SESSION,
+    CART_RATE_WINDOW,
 )
 from session_manager import (
     SessionManager,
     SessionBusyError,
+    SessionAuthError,
     run_cleanup_loop,
     SESSION_TTL_SECONDS,
     MAX_SESSIONS,
@@ -190,6 +194,12 @@ async def _run_limiter_cleanup():
                 rate_limiter.ip_chat_limiter.cleanup_stale()
             if rate_limiter.session_chat_limiter is not None:
                 rate_limiter.session_chat_limiter.cleanup_stale()
+            if rate_limiter.ip_cart_limiter is not None:
+                rate_limiter.ip_cart_limiter.cleanup_stale()
+            if rate_limiter.session_cart_limiter is not None:
+                rate_limiter.session_cart_limiter.cleanup_stale()
+            if rate_limiter.session_ops_limiter is not None:
+                rate_limiter.session_ops_limiter.cleanup_stale()
         except Exception as e:
             print(f"[limiter] 清理异常（忽略）: {e}")
 
@@ -227,7 +237,8 @@ app.add_middleware(
 
 # ======================== 请求/响应模型 ========================
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., min_length=1, max_length=64)
+    session_id: str = Field(default="", max_length=64)
+    session_token: str = Field(default="", max_length=128)
     membership_level: str = Field(default="普通会员", max_length=32)
     user_message: str = Field(..., min_length=1, max_length=2000)
 
@@ -237,10 +248,12 @@ class ChatResponse(BaseModel):
     msg: str
     aimessage: str
     session_id: str
+    session_token: str = ""
 
 
 class ResetRequest(BaseModel):
-    session_id: str = Field(default="", max_length=64)
+    session_id: str = Field(..., min_length=1, max_length=64)
+    session_token: str = Field(..., min_length=1, max_length=128)
 
 
 class ResetResponse(BaseModel):
@@ -311,17 +324,21 @@ def _client_ip(request: Request) -> str:
     return direct_ip or "unknown"
 
 
-def _check_chat_rate_limit(request: Request, session_id: str) -> None:
-    """O(1) 限流检查，超限立即 429，不进入 LLM 调用。
+def _check_rate_limit(
+    request: Request,
+    session_id: str,
+    ses_limiter,
+    ip_limiter,
+    *,
+    ses_label: str,
+    ip_label: str,
+) -> None:
+    """通用限流检查（O(1)），超限立即 429。
 
-    Redis 故障时抛 503（不静默放行，防 LLM 被打爆）。
+    Redis 故障时抛 503（不静默放行，防 LLM / 上游网关被打爆）。
     """
     ip = _client_ip(request)
 
-    # 通过模块属性访问：init_limiters() 在 lifespan 中重新赋值模块级实例，
-    # 按名导入会绑定到旧值（None），故这里走 rate_limiter.<name> 取最新实例。
-    ses_limiter = rate_limiter.session_chat_limiter
-    ip_limiter = rate_limiter.ip_chat_limiter
     if ses_limiter is None or ip_limiter is None:
         raise HTTPException(
             status_code=503,
@@ -334,7 +351,7 @@ def _check_chat_rate_limit(request: Request, session_id: str) -> None:
         if not allowed:
             raise HTTPException(
                 status_code=429,
-                detail=f"会话请求过于频繁，请 {retry_after} 秒后重试",
+                detail=f"{ses_label}请求过于频繁，请 {retry_after} 秒后重试",
                 headers={"Retry-After": str(retry_after)},
             )
 
@@ -342,13 +359,13 @@ def _check_chat_rate_limit(request: Request, session_id: str) -> None:
         if not allowed:
             raise HTTPException(
                 status_code=429,
-                detail=f"IP 请求过于频繁，请 {retry_after} 秒后重试",
+                detail=f"{ip_label}请求过于频繁，请 {retry_after} 秒后重试",
                 headers={"Retry-After": str(retry_after)},
             )
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("限流器检查异常（疑似 Redis 故障），拒绝请求以保护 LLM")
+        logger.exception("限流器检查异常（疑似 Redis 故障），拒绝请求以保护后端")
         raise HTTPException(
             status_code=503,
             detail="限流服务暂不可用，请稍后重试",
@@ -356,11 +373,108 @@ def _check_chat_rate_limit(request: Request, session_id: str) -> None:
         ) from e
 
 
+def _check_chat_rate_limit(request: Request, session_id: str) -> None:
+    """对话接口限流（每会话 + 每 IP）"""
+    _check_rate_limit(
+        request, session_id,
+        rate_limiter.session_chat_limiter,
+        rate_limiter.ip_chat_limiter,
+        ses_label="会话", ip_label="IP",
+    )
+
+
+def _check_cart_rate_limit(request: Request, session_id: str) -> None:
+    """购物车接口限流（更严，上游有调用成本）"""
+    _check_rate_limit(
+        request, session_id,
+        rate_limiter.session_cart_limiter,
+        rate_limiter.ip_cart_limiter,
+        ses_label="会话", ip_label="IP",
+    )
+
+
+def _check_session_ops_rate_limit(request: Request, session_id: str) -> None:
+    """会话管理操作限流（reset 等）"""
+    ip = _client_ip(request)
+    ses_limiter = rate_limiter.session_ops_limiter
+    if ses_limiter is None:
+        raise HTTPException(
+            status_code=503,
+            detail="限流服务尚未就绪，请稍后重试",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        allowed, retry_after = ses_limiter.allow(session_id)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"操作过于频繁，请 {retry_after} 秒后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("限流器检查异常（疑似 Redis 故障）")
+        raise HTTPException(
+            status_code=503,
+            detail="限流服务暂不可用，请稍后重试",
+            headers={"Retry-After": "5"},
+        ) from e
+
+
+def _verify_session_access(session_id: str, session_token: str, *, require_existing: bool) -> tuple[str, str]:
+    """校验会话所有权（C3 IDOR 防御）。
+
+    Args:
+        session_id: 客户端传入的会话 ID
+        session_token: 客户端持有的会话令牌
+        require_existing:
+            True  → session_id 必须已存在且 token 必须匹配（用于 reset/cart、已有会话 chat）
+            False → 允许新会话（session_id 为空时自动创建并签发 token）
+
+    Returns:
+        (resolved_session_id, issued_token_if_new)
+        其中 issued_token_if_new 仅在新创建会话时非空，调用方应回传给客户端。
+
+    Raises:
+        HTTPException 401 — token 缺失或不匹配
+        HTTPException 400 — session_id 格式非法
+    """
+    manager = get_session_manager()
+    sid = session_id.strip() if session_id else ""
+
+    if not sid:
+        if require_existing:
+            raise HTTPException(status_code=400, detail="缺少 session_id")
+        # 新会话：签发
+        new_sid = str(uuid.uuid4())
+        token = manager.issue_token(new_sid)
+        return new_sid, token
+
+    # 已有 session_id：必须校验 token
+    if not session_token:
+        raise HTTPException(
+            status_code=401,
+            detail="缺少 session_token，请重新发起会话",
+        )
+    if not manager.verify_token(sid, session_token):
+        # token 不匹配：可能是会话已过期、被劫持、或攻击者仅持 session_id
+        logger.warning("session_token 校验失败 session_id=%s ip_prefix=%s", sid[:8], "")
+        raise HTTPException(
+            status_code=401,
+            detail="会话凭证无效，请重新发起会话",
+        )
+    return sid, ""
+
+
 # ======================== 接口 ========================
 @app.post("/api/ai/chat", response_model=ChatResponse)
 async def ai_chat(request: ChatRequest, http_request: Request):
     """对话接口，发送用户消息，返回AI回复"""
-    session_id = _resolve_session_id(request.session_id)
+    # 鉴权：新会话签发 token，已有会话校验 token（C3 IDOR 防御）
+    session_id, issued_token = _verify_session_access(
+        request.session_id, request.session_token, require_existing=False
+    )
     _check_chat_rate_limit(http_request, session_id)
 
     manager = get_session_manager()
@@ -389,9 +503,13 @@ async def ai_chat(request: ChatRequest, http_request: Request):
             "msg": "success",
             "aimessage": aimessage,
             "session_id": session_id,
+            "session_token": issued_token,  # 新会话非空，已有会话为空（前端沿用旧 token）
         }
     except HTTPException:
         raise
+    except SessionAuthError as e:
+        logger.warning("chat 鉴权失败 session_id=%s: %s", session_id, e)
+        raise HTTPException(status_code=401, detail="会话凭证无效，请重新发起会话")
     except SessionBusyError:
         raise HTTPException(
             status_code=429,
@@ -413,9 +531,12 @@ async def ai_chat(request: ChatRequest, http_request: Request):
 
 
 @app.post("/api/ai/reset", response_model=ResetResponse)
-async def ai_reset(request: ResetRequest):
-    """重置对话，清空历史上下文"""
-    session_id = _resolve_session_id(request.session_id, auto_create=False)
+async def ai_reset(request: ResetRequest, http_request: Request):
+    """重置对话，清空历史上下文（需 session_token 校验，防越权重置他人会话）"""
+    session_id, _ = _verify_session_access(
+        request.session_id, request.session_token, require_existing=True
+    )
+    _check_session_ops_rate_limit(http_request, session_id)
     manager = get_session_manager()
     manager.reset(session_id)
     return {"code": 200, "msg": "success", "session_id": session_id}
@@ -510,12 +631,23 @@ from cart_api import CartAddRequest as _CartAddRequest, CartAddResponse as _Cart
 
 
 @app.post("/api/cart/add", response_model=_CartAddResponse)
-async def cart_add(request: _CartAddRequest):
+async def cart_add(request: _CartAddRequest, http_request: Request):
     """加入购物车 - 代理调用收钱吧 openApi（RSA2 签名在后端完成）
 
     前端只需传简化字段，后端补全为收钱吧完整格式并签名后转发。
     私钥只在后端，前端无需持有密钥。
+
+    安全（C1 购物车鉴权 + C2 购物车限流）：
+      - 会话鉴权：session_id + session_token 必须匹配，防止越权向他人购物车塞商品（IDOR）。
+      - 限流：每会话 10 次/分钟、每 IP 20 次/分钟，防止收钱吧网关被刷爆。
+      - 购物车操作必须基于已存在的会话（require_existing=True），不允许匿名/新会话直接加购。
     """
+    # C1 会话鉴权：购物车操作必须持有有效会话凭证（require_existing=True）
+    _verify_session_access(
+        request.session_id, request.session_token, require_existing=True
+    )
+    # C2 购物车限流：阈值比对话接口更严（上游网关有调用成本）
+    _check_cart_rate_limit(http_request, request.session_id)
     return await _add_to_cart(request)
 
 

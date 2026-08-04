@@ -22,6 +22,15 @@ CHAT_RATE_PER_SESSION = int(os.environ.get("CHAT_RATE_PER_SESSION", "30"))
 CHAT_RATE_PER_IP = int(os.environ.get("CHAT_RATE_PER_IP", "60"))
 CHAT_RATE_WINDOW = int(os.environ.get("CHAT_RATE_WINDOW", "60"))
 
+# 购物车限流：上游收钱吧网关有调用成本，阈值更严
+CART_RATE_PER_SESSION = int(os.environ.get("CART_RATE_PER_SESSION", "10"))
+CART_RATE_PER_IP = int(os.environ.get("CART_RATE_PER_IP", "20"))
+CART_RATE_WINDOW = int(os.environ.get("CART_RATE_WINDOW", "60"))
+
+# 会话管理操作限流（reset 等）
+SESSION_OPS_RATE_PER_SESSION = int(os.environ.get("SESSION_OPS_RATE_PER_SESSION", "10"))
+SESSION_OPS_RATE_WINDOW = int(os.environ.get("SESSION_OPS_RATE_WINDOW", "60"))
+
 
 class FixedWindowRateLimiter:
     """固定窗口计数限流，单次检查为 O(1)（进程内，仅单 worker）"""
@@ -104,6 +113,9 @@ class RedisFixedWindowRateLimiter:
 # 维持原模块级名称以兼容 api_server 的 import，但实际实例在 init_limiters() 后赋值。
 ip_chat_limiter = None
 session_chat_limiter = None
+ip_cart_limiter = None
+session_cart_limiter = None
+session_ops_limiter = None
 
 
 def init_limiters(redis_client=None) -> None:
@@ -114,6 +126,7 @@ def init_limiters(redis_client=None) -> None:
     必须在 lifespan 启动阶段调用一次。
     """
     global ip_chat_limiter, session_chat_limiter
+    global ip_cart_limiter, session_cart_limiter, session_ops_limiter
     if redis_client is not None:
         session_chat_limiter = RedisFixedWindowRateLimiter(
             redis_client, CHAT_RATE_PER_SESSION, CHAT_RATE_WINDOW, "menu:rl:ses"
@@ -121,8 +134,20 @@ def init_limiters(redis_client=None) -> None:
         ip_chat_limiter = RedisFixedWindowRateLimiter(
             redis_client, CHAT_RATE_PER_IP, CHAT_RATE_WINDOW, "menu:rl:ip"
         )
+        session_cart_limiter = RedisFixedWindowRateLimiter(
+            redis_client, CART_RATE_PER_SESSION, CART_RATE_WINDOW, "menu:rl:cart:ses"
+        )
+        ip_cart_limiter = RedisFixedWindowRateLimiter(
+            redis_client, CART_RATE_PER_IP, CART_RATE_WINDOW, "menu:rl:cart:ip"
+        )
+        session_ops_limiter = RedisFixedWindowRateLimiter(
+            redis_client, SESSION_OPS_RATE_PER_SESSION, SESSION_OPS_RATE_WINDOW, "menu:rl:ops:ses"
+        )
         logger.info("限流器已启用 Redis 共享计数（多 worker 一致）")
     else:
         session_chat_limiter = FixedWindowRateLimiter(CHAT_RATE_PER_SESSION, CHAT_RATE_WINDOW)
         ip_chat_limiter = FixedWindowRateLimiter(CHAT_RATE_PER_IP, CHAT_RATE_WINDOW)
+        session_cart_limiter = FixedWindowRateLimiter(CART_RATE_PER_SESSION, CART_RATE_WINDOW)
+        ip_cart_limiter = FixedWindowRateLimiter(CART_RATE_PER_IP, CART_RATE_WINDOW)
+        session_ops_limiter = FixedWindowRateLimiter(SESSION_OPS_RATE_PER_SESSION, SESSION_OPS_RATE_WINDOW)
         logger.info("限流器使用进程内存计数（仅适用单 worker）")
