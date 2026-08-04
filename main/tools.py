@@ -343,10 +343,10 @@ def _filter_by_customer_type(candidates: list[Dish], customer_type: str) -> list
     """
     if not customer_type:
         return candidates
-    # 归一化：儿童 → 小孩
+    # 归一化：小孩 → 儿童（数据中 suitable_for 统一存"儿童"，见 _parse_kb_suitable_crowd）
     tag = customer_type.strip()
-    if tag == "儿童":
-        tag = "小孩"
+    if tag == "小孩":
+        tag = "儿童"
     if tag not in _DEMOGRAPHIC_TAGS:
         # 场景词，不做硬筛选
         return candidates

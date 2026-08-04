@@ -18,6 +18,7 @@
 
 import logging
 import os
+import re
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -30,6 +31,23 @@ logger = logging.getLogger("agent")
 # LLM 单次请求超时（秒）。超时抛 openai.APITimeoutError，由 API 层映射 503。
 # 短路优化后单轮对话通常仅 1 次 LLM 调用，15s 足够。
 LLM_REQUEST_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "30"))
+
+
+# 防止前端看到方框 □：一次性清除所有可能的“不可渲染”内容。
+# 顺序敏感：先移除配对块（含内部内容），再清理孤立标签，最后剔除控制字符。
+# 1) think 推理块（DeepSeek-R1 等模型把思考过程放 <think>...</think>，整段移除）
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+# 2) DSML 工具调用配对块（含嵌套的 call）
+#    特殊字符：｜ = U+FF5C（全角竖线），▁ = U+2581（DeepSeek 用作下划线/空格）
+_DSML_BLOCK_RE = re.compile(
+    r"<｜tool▁calls▁begin｜>.*?<｜tool▁calls▁end｜>"
+    r"|<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>",
+    re.DOTALL,
+)
+# 3) 配对块移除后残留的孤立 DSML 标签（以 <｜ 开头、｜> 结尾）
+_DSML_TAG_RE = re.compile(r"<｜[^>]*｜>")
+# 4) 思考/DSML 标签的残留孤立标签（未闭合的 think 开/闭标签）
+_THINK_TAG_RE = re.compile(r"</?think\s*>", re.IGNORECASE)
 
 
 class AgentError(Exception):
@@ -70,11 +88,8 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 ```
 天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～
 
---- 菌汤锅底 ---
-  1. 菌汤生态鸡子母锅  ￥68
-     [中辣]
---- 菌彩特色 ---
-  2. 单点绣球菌  ￥32
+【锅底】1. 菌汤生态鸡子母锅  ￥68
+【菌彩特色】2. 单点绣球菌  ￥32
 ...
 合计：￥256
 
@@ -86,6 +101,29 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 - 保持菜品列表格式（分类+序号+菜名+价格+辣度）
 - 结尾 1-2 句收尾（规则避让、过敏原提示 + "如需调整告诉我！"）
 - 整体语气温暖、像朋友推荐，不要冷冰冰的书面语
+
+## 📚 知识库查询结果改写规范（重要）
+当调用 `search_dish_knowledge` / `get_pairing_plan` / `get_exclusion_rules` / `get_fruit_allergen_info` 后，工具返回的是**结构化检索结果**（含"为您找到 X 条相关内容"、相关度分数、【标签】等格式化标记）。你必须将其**改写为自然、口语化的回复**，不要原样复述工具输出格式。
+
+**改写要求**：
+1. **去格式化**：去掉"为您找到 X 条相关内容""[1]""（相关度: 0.68）""【水果过敏】"等检索标签和序号。
+2. **保留关键事实**：风险等级、食用建议、过敏原、搭配方案、互斥规则等事实信息必须完整保留，一字不改。
+3. **自然组织**：用口语化的方式重新组织，像店员向顾客解释一样。可按风险等级/主题归类，加适当的过渡词。
+4. **不编造**：只基于工具返回的内容改写，不得添加检索结果之外的信息。
+5. **简洁明了**：不要冗长，突出顾客最关心的结论。
+
+**示例（用户问"吃完菌子不能吃什么"）**：
+```
+吃完野生菌后，有些水果建议别马上吃，给您说下重点：
+
+高风险水果（吃完菌子后最好间隔4小时以上，且先少量尝试）：
+- 菠萝、芒果、草莓、猕猴桃——这些容易引发过敏或刺激，和菌子同食可能出现嘴麻、红疹、腹痛，还容易和菌子中毒症状混淆，耽误判断。
+
+低风险水果（相对温和，可少量吃，建议间隔1小时以上）：
+- 苹果、梨、香蕉——性质平和，但别一次吃太多冰镇的，以免加重肠胃负担。
+
+简单说，吃完菌子先歇会儿，水果等一等再吃更稳妥～还有其他想了解的吗？
+```
 
 ## 🛡️ 菜品规则合规（最高优先级，自动执行）
 推荐时必须遵守菜品互斥规则和避雷搭配，系统已自动执行以下检查：
@@ -183,8 +221,9 @@ class OrderingAgent:
             "max_retries": 1,
             "max_tokens": 4096,
         }
-        # DeepSeek v3 模型禁用 thinking 模式（v4-flash 等新模型不支持此参数）
-        if "deepseek" in model.lower() and "v3" in model.lower():
+        # DeepSeek 模型禁用 thinking 模式（避免内容进入 reasoning_content 导致 content 为空）
+        # 已验证对 deepseek-chat(v3) 和 deepseek-v4-flash 均有效
+        if "deepseek" in model.lower():
             llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if base_url:
             llm_kwargs["base_url"] = base_url
@@ -218,12 +257,17 @@ class OrderingAgent:
 
         # 无工具调用，直接返回 LLM 回复
         if not ai_msg.tool_calls:
-            response = ai_msg.content or ""
+            response = self._strip_dsml(ai_msg.content or "")
             if not response:
                 raise AgentError("模型未返回任何内容")
             return response, [HumanMessage(content=user_input), AIMessage(content=response)]
 
         # 执行工具调用
+        # 注意：部分模型（如 DeepSeek）会把工具调用的 DSML 标签塞进 ai_msg.content，
+        # 这里把 content 清空，避免后续第 2 次 LLM 调用时把 DSML 原样吐回给用户。
+        # 工具调用本身（tool_calls 字段）不受影响，仍能正常执行。
+        if ai_msg.content:
+            ai_msg = ai_msg.model_copy(update={"content": ""})
         messages.append(ai_msg)
         tool_results = []
         for tc in ai_msg.tool_calls:
@@ -234,16 +278,27 @@ class OrderingAgent:
                 messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
 
         # 短路判断：非推荐场景的结果为完整回复时直接返回，跳过第 2 次 LLM 调用
-        # recommend_dishes 需要 LLM 二次润色生成口语化推荐理由，不短路
-        has_recommend = any(tc["name"] == "recommend_dishes" for tc in ai_msg.tool_calls)
-        if tool_results and not has_recommend:
+        # 以下工具需要 LLM 二次改写/润色，不走短路：
+        #   - recommend_dishes：生成口语化推荐理由
+        #   - 4 个知识库查询工具：把结构化检索结果改写为自然回复（用户明确要求）
+        _TOOLS_NEED_LLM_REWRITE = {
+            "recommend_dishes",
+            "search_dish_knowledge",
+            "get_pairing_plan",
+            "get_exclusion_rules",
+            "get_fruit_allergen_info",
+        }
+        need_rewrite = any(
+            tc["name"] in _TOOLS_NEED_LLM_REWRITE for tc in ai_msg.tool_calls
+        )
+        if tool_results and not need_rewrite:
             final_result = tool_results[-1]
             if self._is_complete_response(final_result):
                 return final_result, [HumanMessage(content=user_input), AIMessage(content=final_result)]
 
         # 第 2 次 LLM 调用：综合多个工具结果或知识库内容生成回复
         final_msg = self.llm.invoke(messages)
-        response = final_msg.content or ""
+        response = self._strip_dsml(final_msg.content or "")
         if not response:
             raise AgentError("模型未返回任何内容")
         return response, [HumanMessage(content=user_input), AIMessage(content=response)]
@@ -260,3 +315,40 @@ class OrderingAgent:
         indicators = ["为您推荐", "合计", "￥", "菜品信息", "菜单列表",
                       "未找到", "搭配方案", "过敏原", "互斥规则"]
         return any(ind in text for ind in indicators)
+
+    @staticmethod
+    def _strip_dsml(text: str) -> str:
+        """清除 LLM 返回中所有可能在前端显示为方框 □ 的内容。
+
+        处理顺序（严格从大到小）：
+          1) 移除 <think>...</think> 配对块（DeepSeek-R1 推理过程，含海量空格/零宽字符）
+          2) 移除 DSML 工具调用配对块（含嵌套 call 的内容：工具名、参数）
+          3) 兜底移除孤立的 think 标签和 DSML 标签（未配对）
+          4) 剔除不可打印 Unicode 控制字符（U+0000–U+001F C0，U+007F DEL，
+             U+0080–U+009F C1）—— 这些是“方框”最常见来源。
+             仅保留：\n(0A) \r(0D) \t(09)
+          5) 合并 3+ 个连续空白行，避免大量空行占位
+        """
+        if not text:
+            return text
+        text = _THINK_BLOCK_RE.sub("", text)
+        text = _DSML_BLOCK_RE.sub("", text)
+        text = _THINK_TAG_RE.sub("", text)
+        text = _DSML_TAG_RE.sub("", text)
+
+        # 剔除不可打印控制字符（是前端渲染成 □ 的第一大来源）
+        text = "".join(
+            ch for ch in text
+            if ch in ("\n", "\r", "\t")
+            or not (
+                ord(ch) < 0x20
+                or ord(ch) == 0x7F
+                or (0x80 <= ord(ch) <= 0x9F)
+            )
+        )
+        # 去掉 BOM / 零宽类（U+FEFF U+200B U+200C U+200D U+2060）
+        text = text.replace("\uFEFF", "").replace("\u200B", "").replace(
+            "\u200C", "").replace("\u200D", "").replace("\u2060", "")
+        # 合并 3+ 连续空白行
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()

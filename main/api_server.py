@@ -64,7 +64,7 @@ try:
 except ImportError:
     pass
 
-from agent import OrderingAgent, AgentError
+from agent import OrderingAgent, AgentError, OrderingAgent as _AgentCls
 from menu_data import get_all_dishes
 import rate_limiter
 from rate_limiter import (
@@ -381,6 +381,9 @@ async def ai_chat(request: ChatRequest, http_request: Request):
                 request.user_message.strip(),
                 request.membership_level.strip(),
             )
+        # API 层再做一次兜底清理：防止 agent 内部任何出口漏网的 DSML / think 块 /
+        # 控制字符跑到前端渲染成方框 □。此处若被清空仍按正常响应返回（空回复）。
+        aimessage = _AgentCls._strip_dsml(aimessage)
         return {
             "code": 200,
             "msg": "success",
@@ -534,4 +537,9 @@ async def serve_index():
 if __name__ == "__main__":
     import uvicorn
     # 本地开发：单 worker。生产部署请使用 gunicorn（见 gunicorn_conf.py / deploy.sh）
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    # 监听地址与端口固定从 .env 读取，避免每次重启手敲命令行参数
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "3000")),
+    )
