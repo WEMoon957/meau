@@ -64,7 +64,7 @@ try:
 except ImportError:
     pass
 
-from agent import OrderingAgent, AgentError, OrderingAgent as _AgentCls
+from agent import OrderingAgent, AgentError
 from menu_data import get_all_dishes
 import rate_limiter
 from rate_limiter import (
@@ -383,7 +383,7 @@ async def ai_chat(request: ChatRequest, http_request: Request):
             )
         # API 层再做一次兜底清理：防止 agent 内部任何出口漏网的 DSML / think 块 /
         # 控制字符跑到前端渲染成方框 □。此处若被清空仍按正常响应返回（空回复）。
-        aimessage = _AgentCls._strip_dsml(aimessage)
+        aimessage = OrderingAgent._strip_dsml(aimessage)
         return {
             "code": 200,
             "msg": "success",
