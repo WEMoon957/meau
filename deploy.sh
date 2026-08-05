@@ -9,6 +9,7 @@ PYTHON_VERSION="3.11"
 read -p "请输入 OPENAI_API_KEY: " API_KEY
 read -p "请输入 MySQL root 密码: " DB_ROOT_PASSWORD
 read -p "请输入数据库密码: " DB_PASSWORD
+read -p "请输入管理端点 ADMIN_API_TOKEN（留空将禁用管理端点）: " ADMIN_TOKEN
 
 echo ""
 echo "=========================================="
@@ -68,6 +69,7 @@ MAX_CONCURRENT_CHATS=20
 CHAT_RATE_PER_SESSION=30
 CHAT_RATE_PER_IP=60
 CHAT_RATE_WINDOW=60
+ADMIN_API_TOKEN=${ADMIN_TOKEN}
 EOF
 
 cd ${APP_DIR}/main

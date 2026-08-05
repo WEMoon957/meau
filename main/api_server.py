@@ -10,6 +10,7 @@
 import asyncio
 import io
 import os
+import secrets
 import sys
 import uuid
 
@@ -26,7 +27,7 @@ if sys.platform == "win32":
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -53,6 +54,10 @@ from vector_store import preload_vector_store
 # ======================== 配置 ========================
 DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "qwen-turbo")
 MAX_CONCURRENT_CHATS = int(os.environ.get("MAX_CONCURRENT_CHATS", "20"))
+
+# 管理端点认证 token（管理类写操作需通过 X-Admin-Token 校验）
+# 未配置时管理端点直接禁用，拒绝所有请求
+ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "")
 
 _chat_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHATS)
 _session_manager: SessionManager | None = None
@@ -136,6 +141,22 @@ class ResetResponse(BaseModel):
     code: int
     msg: str
     session_id: str
+
+
+class AddScriptRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2000)
+    script_type: str = Field(default="custom", max_length=32)
+    dish_name: str = Field(default="", max_length=100)
+    scene: str = Field(default="", max_length=200)
+
+
+def _require_admin(x_admin_token: str = Header(default="")) -> None:
+    """管理端点认证：校验 X-Admin-Token 与配置的 ADMIN_API_TOKEN（常量时间比较）"""
+    if not ADMIN_API_TOKEN:
+        # 未配置管理 token 时，管理端点直接禁用
+        raise HTTPException(status_code=503, detail="管理端点未启用（未配置 ADMIN_API_TOKEN）")
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, ADMIN_API_TOKEN):
+        raise HTTPException(status_code=401, detail="未授权的管理请求")
 
 
 def _resolve_session_id(session_id: str, *, auto_create: bool = True) -> str:
@@ -271,6 +292,31 @@ async def ai_info():
             },
         }
     }
+
+
+@app.post("/api/admin/script")
+async def admin_add_script(
+    payload: AddScriptRequest,
+    _: None = Depends(_require_admin),
+):
+    """管理端点：向话术向量库添加自定义话术（需 X-Admin-Token 认证）
+
+    该写操作不暴露给匿名 Agent，仅限持有管理 token 的调用方使用，
+    避免匿名用户通过提示词诱导 LLM 写入持久化投毒内容。
+    """
+    from vector_store import add_script
+
+    try:
+        msg = add_script(
+            payload.content,
+            payload.script_type,
+            payload.dish_name,
+            payload.scene,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"code": 200, "msg": msg}
 
 
 if __name__ == "__main__":
