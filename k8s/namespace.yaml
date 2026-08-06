@@ -1,0 +1,7 @@
+# 命名空间：meau
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: meau
+  labels:
+    app.kubernetes.io/part-of: meau

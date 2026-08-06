@@ -1,0 +1,89 @@
+# Redis：集群内单实例（带 PVC 持久化）
+# 仅适用于开发/测试。生产建议使用云托管 Redis 或 Redis Operator（高可用）。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: meau
+  labels:
+    app: redis
+    app.kubernetes.io/part-of: meau
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        app.kubernetes.io/part-of: meau
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6379
+              name: redis
+          # 持久化：appendonly + RDB
+          command: ["redis-server"]
+          args:
+            - --appendonly
+            - "yes"
+            - --save
+            - "60,100"
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - allkeys-lru
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Redis Service：ClusterIP（集群内访问）
+# 应用通过 REDIS_URL=redis://redis.meau.svc.cluster.local:6379/0 连接
+# 注：单实例无需 Headless Service；若需稳定 Pod DNS（如多实例），
+#     可加一个 clusterIP: None 的 Headless Service 配合 StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: meau
+  labels:
+    app: redis
+    app.kubernetes.io/part-of: meau
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: redis
