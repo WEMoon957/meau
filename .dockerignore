@@ -1,0 +1,39 @@
+# 敏感配置（含 API Key / 数据库密码，绝不能进镜像层）
+.env
+.env.*
+!.env.example
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+
+# 向量库本地数据（运行时挂载或外接持久卷，不进镜像）
+kb_data/
+vector_db/
+
+# 日志与调试
+*.log
+debug.log
+
+# 临时/测试脚本（不参与运行）
+test_*.py
+_patch_*.py
+test_*.json
+
+# IDE 与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 前端构建产物与文档包（非镜像运行依赖）
+.trae-html-share-packages/
+meau-api-doc/
+package-lock.json

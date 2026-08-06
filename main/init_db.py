@@ -40,12 +40,15 @@ def create_tables():
     conn = pymysql.connect(database=DB_NAME, **DB_SERVER_CONFIG)
     cursor = conn.cursor()
 
+    # 与真实数据库 restaurant.dishes 表 schema 保持一致
+    # （参见 migrate_menu.py 的 ensure_dishes_table）
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS dishes (
             id            INT AUTO_INCREMENT PRIMARY KEY,
             name          VARCHAR(100)  NOT NULL COMMENT '菜品名称',
-            price         DECIMAL(10,2) NOT NULL COMMENT '价格',
-            category      VARCHAR(20)   NOT NULL COMMENT '分类: 凉菜/热菜/汤品/主食/饮品/甜点',
+            price         DECIMAL(10,2) COMMENT '价格',
+            gross_margin  DECIMAL(5,2)  COMMENT '毛利率(0~1)',
+            category      VARCHAR(50)   NOT NULL DEFAULT '' COMMENT '分类',
             spicy_level   VARCHAR(20)   NOT NULL DEFAULT '不辣' COMMENT '辣度: 不辣/微辣/中辣/特辣',
             suitable_for  JSON          COMMENT '适合人群列表',
             dietary_tags  JSON          COMMENT '饮食标签列表: 素食/低脂/低糖/高蛋白/无麸质',
@@ -76,14 +79,15 @@ def import_data():
 
     sql = """
         INSERT INTO dishes
-            (id, name, price, category, spicy_level, suitable_for, dietary_tags,
+            (id, name, price, gross_margin, category, spicy_level, suitable_for, dietary_tags,
              allergens, description, is_signature, seasonal, weather_fit)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     for dish in MENU:
         cursor.execute(sql, (
-            dish.id, dish.name, dish.price, dish.category, dish.spicy_level,
+            dish.id, dish.name, dish.price, dish.gross_margin,
+            dish.category, dish.spicy_level,
             json.dumps(dish.suitable_for, ensure_ascii=False),
             json.dumps(dish.dietary_tags, ensure_ascii=False),
             json.dumps(dish.allergens, ensure_ascii=False),
