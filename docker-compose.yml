@@ -1,0 +1,102 @@
+# 菌彩点餐智能体 - 单机 ECS 部署
+# 使用方式：
+#   1. 在项目根目录创建 .env.docker（敏感凭证，见下方说明）
+#   2. docker compose up -d
+#   3. docker compose logs -f app
+#
+# 架构：
+#   nginx (80) → app (gunicorn:3000)
+#   app → redis (6379)
+#   app → 腾讯云 TDSQL-C MySQL (外网)
+#
+# .env.docker 文件内容（不要提交到 git）：
+#   OPENAI_API_KEY=sk-xxx
+#   EMBEDDING_API_KEY=sk-ws-xxx
+#   SQB_PRIVATE_KEY=<完整 PEM，含换行>
+#   DB_HOST=sh-cynosdbmysql-grp-nwl19gmw.sql.tencentcdb.com
+#   DB_PORT=24693
+#   DB_USER=root
+#   DB_PASSWORD=Aa!211719
+#   DB_NAME=flask_demo
+#   CORS_ALLOWED_ORIGINS=https://your-frontend.com
+
+services:
+  app:
+    image: meau:local
+    container_name: meau-app
+    restart: unless-stopped
+    # 不用 env_file，改用 environment + .env.docker，便于区分敏感与非敏感
+    env_file:
+      - .env.docker
+    environment:
+      # 非敏感配置直接写死
+      OPENAI_BASE_URL: https://api.deepseek.com/v1
+      OPENAI_MODEL: deepseek-v4-flash
+      EMBEDDING_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+      EMBEDDING_MODEL: text-embedding-v3
+      USE_DATABASE: "true"
+      DB_POOL_SIZE: "20"
+      DB_POOL_MIN_CACHED: "2"
+      DB_POOL_MAX_CACHED: "5"
+      DB_CONN_RECYCLE: "1800"
+      DB_MAX_EXECUTION_MS: "5000"
+      DB_DISH_LIMIT: "1000"
+      REDIS_URL: redis://redis:6379/0
+      WORKERS: "4"
+      MAX_CONCURRENT_CHATS: "20"
+      LLM_REQUEST_TIMEOUT: "30"
+      SESSION_TTL_SECONDS: "1800"
+      SESSION_CLEANUP_INTERVAL: "300"
+      MAX_SESSIONS: "500"
+      CHAT_RATE_PER_SESSION: "30"
+      CHAT_RATE_PER_IP: "60"
+      CHAT_RATE_WINDOW: "60"
+      CART_RATE_PER_SESSION: "10"
+      CART_RATE_PER_IP: "20"
+      CART_RATE_WINDOW: "60"
+      SESSION_OPS_RATE_PER_SESSION: "10"
+      SESSION_OPS_RATE_WINDOW: "60"
+      TRUSTED_PROXIES: "127.0.0.1/32"
+      LOG_LEVEL: INFO
+      GUNICORN_TIMEOUT: "60"
+      GUNICORN_GRACEFUL_TIMEOUT: "75"
+      GUNICORN_MAX_REQUESTS: "1000"
+      GUNICORN_MAX_REQUESTS_JITTER: "50"
+      SQB_APP_ID: "202607161527269102513553408"
+      SQB_GATEWAY_URL: https://test-gateway-openapi-kaci.shouqianba.com/api/1.0
+      SQB_VERSION: "1.0"
+    ports:
+      - "127.0.0.1:3000:3000"  # 仅本机监听，由 nginx 反代
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    networks:
+      - meau-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: meau-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --save 60,100 --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - meau-net
+
+volumes:
+  redis-data:
+
+networks:
+  meau-net:
+    driver: bridge
