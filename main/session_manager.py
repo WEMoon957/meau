@@ -165,7 +165,13 @@ class SessionManager:
         lock_token = self._acquire_lock(session_id)
         try:
             history = self._load_history(session_id)
-            response, new_msgs = self.agent.chat(user_input, history, membership_level)
+            # 设置历史上下文：add_to_cart 工具在"确认下单"场景从中提取推荐菜名
+            from tools import set_history_context, reset_history_context
+            hist_token = set_history_context(history)
+            try:
+                response, new_msgs = self.agent.chat(user_input, history, membership_level)
+            finally:
+                reset_history_context(hist_token)
             new_history = (history + new_msgs)[-self.agent.MAX_HISTORY:]
             self._save_history(session_id, new_history)
             return response

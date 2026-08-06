@@ -33,6 +33,24 @@ from menu_data import find_dish_by_name
 logger = logging.getLogger("cart_agent")
 
 
+# 模块级单例：由 api_server.lifespan 初始化，add_to_cart 工具通过 get_cart_agent() 访问。
+# 避免循环依赖：tools.py 不能从 api_server 导入，故单例放在 cart_agent 模块。
+_cart_agent_instance: "CartAgent | None" = None
+
+
+def init_cart_agent(agent: "CartAgent") -> None:
+    """初始化模块级 CartAgent 单例（api_server.lifespan 调用）。"""
+    global _cart_agent_instance
+    _cart_agent_instance = agent
+
+
+def get_cart_agent() -> "CartAgent":
+    """获取 CartAgent 单例。未初始化时抛 RuntimeError。"""
+    if _cart_agent_instance is None:
+        raise RuntimeError("CartAgent 尚未初始化，请先调用 init_cart_agent")
+    return _cart_agent_instance
+
+
 # LLM 单次请求超时（与 OrderingAgent 一致）
 CART_LLM_TIMEOUT = float(os.environ.get("LLM_REQUEST_TIMEOUT", "30"))
 

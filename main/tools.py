@@ -3,10 +3,75 @@
 菜品查询、智能推荐、菜品知识库查询，供 LangChain Agent 调用。
 """
 
+import contextvars
 import copy
+import logging
 from langchain_core.tools import tool
 
 from menu_data import Dish, get_all_dishes
+
+logger = logging.getLogger("tools")
+
+
+# ======================== 会话上下文（供 add_to_cart 工具拿凭证+历史） ========================
+# 方案 A：统一入口 + LLM 路由后，add_to_cart 工具由 LLM 在 agent.chat 内触发，
+# 但工具函数无法直接拿到 session_id/session_token/history。用 contextvars 在
+# SessionManager.chat 设置当前请求的会话凭证与历史，工具内部读取。
+# contextvars 在 asyncio.to_thread 中自动传播，线程安全。
+_session_ctx: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "_session_ctx", default=None
+)
+# 会话历史（list[HumanMessage|AIMessage]）：供 add_to_cart 在"确认下单"场景
+# 从最近推荐中提取菜名。由 SessionManager.chat 在加载历史后设置。
+_history_ctx: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "_history_ctx", default=None
+)
+
+
+def set_session_context(session_id: str, session_token: str) -> contextvars.Token:
+    """设置当前请求的会话凭证（api_server.ai_chat 调用）。
+
+    Returns:
+        contextvars.Token，用于 reset 恢复上下文（请求结束清理）。
+    """
+    return _session_ctx.set((session_id, session_token))
+
+
+def reset_session_context(token: contextvars.Token) -> None:
+    """恢复会话上下文（请求结束清理，避免上下文泄漏到下一个请求）。"""
+    _session_ctx.reset(token)
+
+
+def set_history_context(history: list) -> contextvars.Token:
+    """设置当前请求的会话历史（SessionManager.chat 加载历史后调用）。
+
+    供 add_to_cart 工具在"确认下单"场景从最近推荐中提取菜名。
+    """
+    return _history_ctx.set(history)
+
+
+def reset_history_context(token: contextvars.Token) -> None:
+    """恢复历史上下文（请求结束清理）。"""
+    _history_ctx.reset(token)
+
+
+def _extract_dish_names_from_history(history: list) -> list[str]:
+    """从会话历史中提取最近一次推荐的菜名。
+
+    推荐结果的 AIMessage 格式为"菜名  ￥价格"，用正则提取。
+    从后往前找第一条包含"￥"的 AIMessage。
+    """
+    import re
+    for msg in reversed(history):
+        content = getattr(msg, "content", "") or ""
+        if "￥" not in content:
+            continue
+        # 匹配"菜名  ￥价格"格式（菜名前可能有序号/缩进）
+        names = re.findall(r"([\u4e00-\u9fa5\w·]+)\s+￥\d+", content)
+        if names:
+            # 过滤掉明显不是菜名的（如"合计"）
+            return [n.strip() for n in names if n.strip() and n != "合计"]
+    return []
 
 
 # ======================== 双源数据合并（向量库 + MySQL） ========================
@@ -1191,6 +1256,68 @@ def generate_recommendation_reason(
     return "。".join(parts)
 
 
+# ======================== 加购工具（方案 A：统一入口 + LLM 路由） ========================
+# 用户用自然语言说要加什么菜（如"来份水煮鱼加购"），LLM 识别意图后调用本工具。
+# 工具内部从 contextvars 拿会话凭证，复用 CartAgent（LLM 提取菜名+数量 → 反查 → 加购）。
+# 与 OrderingAgent 平行，但作为工具被 OrderingAgent 调用，实现统一入口。
+
+@tool
+def add_to_cart(user_input: str) -> str:
+    """将顾客指定的菜品加入购物车。当顾客表达加购/下单意图时使用本工具。
+
+    适用场景（必须调用本工具，不要口头回复"已加入"）：
+    - 明确加购："来份XX加购""把XX加到购物车""加一份XX"
+    - 确认下单："确认下单""就这些""下单吧"（基于最近推荐列表）
+    - 自然语言加购："再来一份刚才那个XX""给我来两个XX"
+
+    不适用场景（不要调用本工具）：
+    - 纯推荐请求（"推荐几个菜"）→ 调用 recommend_dishes
+    - 菜品咨询（"XX多少钱"）→ 调用 query_dish
+    - 闲聊/打招呼 → 直接回复
+
+    工具内部会从顾客的自然语言中提取菜名和数量，自动完成加购。
+    如果顾客说"确认下单/就这些"但没指定菜名，工具会自动提取最近推荐的菜品。
+
+    Args:
+        user_input: 顾客的原始输入文本（如"来份水煮鱼加购""确认下单"）
+    """
+    # 从 contextvars 拿会话凭证（由 api_server.ai_chat 设置）
+    ctx = _session_ctx.get()
+    if ctx is None:
+        return "加购失败：会话凭证缺失，请重新发起对话。"
+    session_id, session_token = ctx
+
+    # 复用 CartAgent 完成菜名提取 + 加购
+    # CartAgent 通过模块级单例访问，避免每次调用重建 LLM 客户端
+    try:
+        from cart_agent import get_cart_agent
+        agent = get_cart_agent()
+    except Exception as e:
+        logger.error("add_to_cart: CartAgent 未初始化: %s", e)
+        return "加购服务暂时不可用，请稍后重试。"
+
+    try:
+        reply, cart_result = agent.chat(user_input, session_id, session_token)
+
+        # 确认下单场景：CartAgent 未识别到具体菜名时，从会话历史提取最近推荐菜名
+        # 用户说"确认下单/就这些"但没指定菜名，CartAgent 会返回"未识别"提示
+        # 此时从 history 中最近一条推荐 AIMessage 提取菜名，重新加购
+        if not cart_result and "未识别" in reply:
+            history = _history_ctx.get()
+            if history:
+                dish_names = _extract_dish_names_from_history(history)
+                if dish_names:
+                    logger.info("add_to_cart: 确认下单场景，从历史提取 %d 道菜", len(dish_names))
+                    # 把菜名拼接成 CartAgent 能识别的格式，重新调用
+                    combined = "、".join(dish_names) + " 各一份加购"
+                    reply, cart_result = agent.chat(combined, session_id, session_token)
+
+        return reply
+    except Exception as e:
+        logger.exception("add_to_cart: CartAgent 调用失败")
+        return f"加购失败：{e}"
+
+
 # 所有工具列表（供 Agent 使用）
 ALL_TOOLS = [
     query_dish,
@@ -1202,4 +1329,6 @@ ALL_TOOLS = [
     get_exclusion_rules,
     get_fruit_allergen_info,
     generate_recommendation_reason,
+    # 加购工具（方案 A：统一入口 + LLM 路由）
+    add_to_cart,
 ]

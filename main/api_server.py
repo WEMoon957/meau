@@ -164,6 +164,9 @@ async def lifespan(_app: FastAPI):
     _session_manager = SessionManager(agent, redis_client=_redis_client)
     # 加购子 Agent（与 OrderingAgent 平行，复用同一 LLM 配置）
     _cart_agent = _create_cart_agent()
+    # 同步初始化 cart_agent 模块单例，供 add_to_cart 工具访问
+    from cart_agent import init_cart_agent
+    init_cart_agent(_cart_agent)
 
     # 4. 预热数据
     get_all_dishes()
@@ -505,13 +508,20 @@ async def ai_chat(request: ChatRequest, http_request: Request):
 
     try:
         async with _chat_semaphore:
-            # 无状态 agent + Redis 历史：在线程池中执行（graph.invoke 为同步阻塞调用）
-            aimessage = await asyncio.to_thread(
-                manager.chat,
-                session_id,
-                request.user_message.strip(),
-                request.membership_level.strip(),
-            )
+            # 设置会话上下文：add_to_cart 工具通过 contextvars 读取凭证
+            # contextvars 在 asyncio.to_thread 中自动传播，线程安全
+            from tools import set_session_context, reset_session_context
+            ctx_token = set_session_context(session_id, request.session_token)
+            try:
+                # 无状态 agent + Redis 历史：在线程池中执行（graph.invoke 为同步阻塞调用）
+                aimessage = await asyncio.to_thread(
+                    manager.chat,
+                    session_id,
+                    request.user_message.strip(),
+                    request.membership_level.strip(),
+                )
+            finally:
+                reset_session_context(ctx_token)
         # API 层再做一次兜底清理：防止 agent 内部任何出口漏网的 DSML / think 块 /
         # 控制字符跑到前端渲染成方框 □。此处若被清空仍按正常响应返回（空回复）。
         aimessage = OrderingAgent._strip_dsml(aimessage)
