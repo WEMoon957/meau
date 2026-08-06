@@ -48,10 +48,14 @@ _pool: Optional[PooledDB] = None
 
 
 def _get_pool() -> PooledDB:
-    """返回连接池（模块加载时已创建，懒加载保留为兜底）。
+    """返回连接池（懒加载：首次访问数据库时才创建，导入阶段不建池）。
 
-    说明：gunicorn preload_app=False（当前配置）时每个 worker 独立导入模块，
-    在导入时即建池是 fork 安全的；若改回 preload_app=True 需恢复纯懒加载。
+    说明：
+      - 移除模块顶层 _get_pool() 调用，避免 import 时即建立 TCP+认证连接，
+        若数据库未就绪会导致整个模块导入失败，进而 worker 启动崩溃（502 根因之一）。
+      - gunicorn preload_app=False（当前配置）时每个 worker 独立导入模块，
+        首次 get_connection() 触发建池，fork 安全。
+      - 若改回 preload_app=True 需确保建池在 worker fork 之后（lifespan 内）。
     """
     global _pool
     if _pool is None:
@@ -67,10 +71,6 @@ def _get_pool() -> PooledDB:
             **DB_CONFIG,
         )
     return _pool
-
-
-# 模块加载时即创建连接池，确保数据库连接一直开启（eager 初始化）
-_get_pool()
 
 
 def get_connection():
