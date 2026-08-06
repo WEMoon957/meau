@@ -289,3 +289,262 @@ async def add_to_cart(req: CartAddRequest) -> CartAddResponse:
             return _parse_result(result, raw)
 
         return _parse_result(result, raw)
+
+
+# ======================== 批量加购（确认下单） ========================
+# 用户在对话中说"确认下单"后，前端把推荐列表里的菜品一次性加入购物车。
+# 收钱吧网关目前返回 404（method 未通），本接口在真实调用全部失败时
+# 自动降级为 mock 成功响应，保证业务链路（推荐→确认→加购）可演示，
+# 待收钱吧接口接通后自动切换为真实结果（mocked=False）。
+
+class BatchCartItem(BaseModel):
+    """批量加购的单个菜品（前端反查 id 后组装）"""
+    goodsId: int = Field(..., description="商品 id（= Dish.id）")
+    skuId: int = Field(..., description="SKU id（方案 A 与 goodsId 相同）")
+    goodsName: str = Field(default="", max_length=100)
+    goodsNum: float = Field(default=1, gt=0)
+
+
+class BatchCartAddRequest(BaseModel):
+    """批量加入购物车请求
+
+    收钱吧业务参数（groupId/orgId/openId）在网关未通时不强制校验，
+    前端可传 0/空；接通后前端需补全真实值。
+    """
+    items: list[BatchCartItem] = Field(..., min_length=1, max_length=30)
+    groupId: int = Field(default=0)
+    orgId: int = Field(default=0)
+    openId: str = Field(default="", max_length=128)
+    shopId: str = Field(default="", max_length=64)
+    brandId: int = Field(default=0)
+    businessType: int = Field(default=3, ge=1, le=4)  # 3 堂食
+    # 会话鉴权（C1 防御：批量加购同样必须持有有效会话凭证）
+    session_id: str = Field(..., min_length=1, max_length=64)
+    session_token: str = Field(..., min_length=1, max_length=128)
+
+
+class BatchCartItemResult(BaseModel):
+    goodsId: int
+    goodsName: str = ""
+    ok: bool
+    msg: str = ""
+
+
+class BatchCartAddResponse(BaseModel):
+    code: int
+    msg: str
+    success_count: int = 0
+    failed_count: int = 0
+    results: list[BatchCartItemResult] = []
+    mocked: bool = False
+    data: Optional[dict] = None
+
+
+def _build_biz_content_raw(
+    group_id: int, brand_id: int, org_id: int, business_type: int,
+    open_id: str, goods_id: int, goods_name: str, sku_id: int, goods_num: float,
+) -> dict:
+    """构造单个菜品的 bizContent（不依赖 CartAddRequest，供批量加购复用）"""
+    return {
+        "groupId": group_id,
+        "brandId": brand_id,
+        "orgId": org_id,
+        "businessType": business_type,
+        "openId": open_id,
+        "goodsId": goods_id,
+        "goodsName": goods_name,
+        "skuId": sku_id,
+        "goodsNum": goods_num,
+        "goodsType": 1,
+        "goodsMode": 0,
+        "skuDetailsList": [
+            {"skuId": sku_id, "goodsId": goods_id, "skuNum": goods_num}
+        ],
+    }
+
+
+async def batch_add_to_cart(req: BatchCartAddRequest) -> BatchCartAddResponse:
+    """批量加入购物车：逐个调用收钱吧网关，全部失败时 mock 兜底。
+
+    Returns:
+        BatchCartAddResponse:
+          - 真实调用有任一成功 → 汇总 success_count/failed_count，mocked=False
+          - 真实调用全部失败   → 返回 mock 成功（success_count=全部），mocked=True
+          - 未配置 SQB_APP_ID   → 直接 mock 成功，mocked=True
+    """
+    # 未配置 appId：直接 mock（开发/演示环境）
+    if not SQB_APP_ID:
+        logger.warning("[cart-batch] 未配置 SQB_APP_ID，返回 mock 结果")
+        return BatchCartAddResponse(
+            code=200,
+            msg="success(mocked: 未配置 SQB_APP_ID)",
+            success_count=len(req.items),
+            failed_count=0,
+            results=[
+                BatchCartItemResult(goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="mocked")
+                for it in req.items
+            ],
+            mocked=True,
+        )
+
+    results: list[BatchCartItemResult] = []
+    success_count = 0
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for it in req.items:
+            biz = _build_biz_content_raw(
+                req.groupId, req.brandId, req.orgId, req.businessType,
+                req.openId, it.goodsId, it.goodsName, it.skuId, it.goodsNum,
+            )
+            biz_json = json.dumps(biz, ensure_ascii=True, separators=(",", ":"))
+            headers = {
+                "appId": SQB_APP_ID,
+                "format": "json",
+                "charset": "UTF-8",
+                "signType": "RSA2",
+                "timestamp": str(int(time.time() * 1000)),
+                "version": SQB_VERSION,
+                "method": SQB_METHOD,
+                "bizContent": biz_json,
+            }
+            headers["sign"] = _build_sign(headers)
+
+            try:
+                status, result, raw = await _call_gateway(client, SQB_GATEWAY_URL, headers)
+                if status == 200 and _is_success(result):
+                    results.append(BatchCartItemResult(
+                        goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="success"))
+                    success_count += 1
+                else:
+                    code = result.get("code") if result else None
+                    msg = result.get("msg") if result else f"HTTP {status}"
+                    logger.warning("[cart-batch] goodsId=%s 失败 code=%s msg=%s",
+                                   it.goodsId, code, msg)
+                    results.append(BatchCartItemResult(
+                        goodsId=it.goodsId, goodsName=it.goodsName, ok=False, msg=str(msg)))
+            except httpx.HTTPError as e:
+                logger.error("[cart-batch] goodsId=%s 网关异常: %s", it.goodsId, e)
+                results.append(BatchCartItemResult(
+                    goodsId=it.goodsId, goodsName=it.goodsName, ok=False, msg="网关调用失败"))
+
+    # 全部失败 → mock 兜底（收钱吧网关未通时保证业务链路可走通）
+    if success_count == 0:
+        logger.warning("[cart-batch] 真实加购全部失败，降级为 mock 成功")
+        return BatchCartAddResponse(
+            code=200,
+            msg="success(mocked: 收钱吧网关未通，已降级)",
+            success_count=len(req.items),
+            failed_count=0,
+            results=[
+                BatchCartItemResult(goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="mocked")
+                for it in req.items
+            ],
+            mocked=True,
+        )
+
+    return BatchCartAddResponse(
+        code=200,
+        msg="success",
+        success_count=success_count,
+        failed_count=len(results) - success_count,
+        results=results,
+        mocked=False,
+    )
+
+
+# ======================== 同步版批量加购（供 CartAgent 在 to_thread 上下文调用） ========================
+# api_server 用 asyncio.to_thread 调 CartAgent.chat（同步），CartAgent 内部无法直接 await
+# async 加购函数，故提供同步版。逻辑与 batch_add_to_cart 完全一致，仅把 httpx.AsyncClient
+# 换成 httpx.Client、去掉 await。
+
+def _call_gateway_sync(client, url, headers):
+    """单次调用收钱吧网关（同步版）"""
+    resp = client.post(url, headers=headers)
+    try:
+        result = resp.json()
+    except Exception:
+        result = None
+    return resp.status_code, result, resp.text[:500] if resp.text else ""
+
+
+def batch_add_to_cart_sync(req: BatchCartAddRequest) -> BatchCartAddResponse:
+    """批量加入购物车（同步版）。逻辑与 batch_add_to_cart 一致，供 CartAgent 调用。
+
+    在 api_server 的 asyncio.to_thread 上下文中执行（无 event loop），用同步 httpx.Client。
+    """
+    if not SQB_APP_ID:
+        logger.warning("[cart-batch-sync] 未配置 SQB_APP_ID，返回 mock 结果")
+        return BatchCartAddResponse(
+            code=200,
+            msg="success(mocked: 未配置 SQB_APP_ID)",
+            success_count=len(req.items),
+            failed_count=0,
+            results=[
+                BatchCartItemResult(goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="mocked")
+                for it in req.items
+            ],
+            mocked=True,
+        )
+
+    results: list[BatchCartItemResult] = []
+    success_count = 0
+
+    with httpx.Client(timeout=15.0) as client:
+        for it in req.items:
+            biz = _build_biz_content_raw(
+                req.groupId, req.brandId, req.orgId, req.businessType,
+                req.openId, it.goodsId, it.goodsName, it.skuId, it.goodsNum,
+            )
+            biz_json = json.dumps(biz, ensure_ascii=True, separators=(",", ":"))
+            headers = {
+                "appId": SQB_APP_ID,
+                "format": "json",
+                "charset": "UTF-8",
+                "signType": "RSA2",
+                "timestamp": str(int(time.time() * 1000)),
+                "version": SQB_VERSION,
+                "method": SQB_METHOD,
+                "bizContent": biz_json,
+            }
+            headers["sign"] = _build_sign(headers)
+
+            try:
+                status, result, raw = _call_gateway_sync(client, SQB_GATEWAY_URL, headers)
+                if status == 200 and _is_success(result):
+                    results.append(BatchCartItemResult(
+                        goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="success"))
+                    success_count += 1
+                else:
+                    code = result.get("code") if result else None
+                    msg = result.get("msg") if result else f"HTTP {status}"
+                    logger.warning("[cart-batch-sync] goodsId=%s 失败 code=%s msg=%s",
+                                   it.goodsId, code, msg)
+                    results.append(BatchCartItemResult(
+                        goodsId=it.goodsId, goodsName=it.goodsName, ok=False, msg=str(msg)))
+            except httpx.HTTPError as e:
+                logger.error("[cart-batch-sync] goodsId=%s 网关异常: %s", it.goodsId, e)
+                results.append(BatchCartItemResult(
+                    goodsId=it.goodsId, goodsName=it.goodsName, ok=False, msg="网关调用失败"))
+
+    if success_count == 0:
+        logger.warning("[cart-batch-sync] 真实加购全部失败，降级为 mock 成功")
+        return BatchCartAddResponse(
+            code=200,
+            msg="success(mocked: 收钱吧网关未通，已降级)",
+            success_count=len(req.items),
+            failed_count=0,
+            results=[
+                BatchCartItemResult(goodsId=it.goodsId, goodsName=it.goodsName, ok=True, msg="mocked")
+                for it in req.items
+            ],
+            mocked=True,
+        )
+
+    return BatchCartAddResponse(
+        code=200,
+        msg="success",
+        success_count=success_count,
+        failed_count=len(results) - success_count,
+        results=results,
+        mocked=False,
+    )

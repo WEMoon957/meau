@@ -207,6 +207,53 @@
         }
         .summary-bar .tag .x:hover { color: #e74c3c; }
         .summary-bar .placeholder { color: #aaa; }
+
+        /* ===== 确认下单输入区 ===== */
+        .order-input-bar {
+            display: flex;
+            gap: 8px;
+            padding: 10px 24px 14px;
+            background: #fff;
+            border-top: 1px solid #eef0f4;
+        }
+        .order-input-bar input {
+            flex: 1;
+            padding: 9px 12px;
+            border: 1px solid #dde1e7;
+            border-radius: 8px;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .order-input-bar input:focus { border-color: #667eea; }
+        .order-input-bar button {
+            padding: 9px 18px;
+            background: #667eea;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .order-input-bar button:hover { background: #5568d3; }
+        .order-input-bar button:disabled { background: #b8bfd1; cursor: not-allowed; }
+
+        /* 加购结果气泡 */
+        .msg.assistant .bubble .r-cart {
+            margin-top: 10px; padding: 10px 12px;
+            background: #f0f9f0; border-left: 3px solid #27ae60;
+            border-radius: 4px; font-size: 13px; color: #1e7e34; line-height: 1.7;
+        }
+        .msg.assistant .bubble .r-cart-fail {
+            margin-top: 10px; padding: 10px 12px;
+            background: #fff6f6; border-left: 3px solid #e74c3c;
+            border-radius: 4px; font-size: 13px; color: #c0392b; line-height: 1.7;
+        }
+        .msg.assistant .bubble .r-cart-item {
+            display: flex; justify-content: space-between;
+            padding: 3px 0; font-size: 13px;
+        }
     </style>
 </head>
 <body>
@@ -241,6 +288,10 @@
 
             <div class="summary-bar" id="summaryBar">
                 <span class="placeholder">尚未选择任何项</span>
+            </div>
+            <div class="order-input-bar">
+                <input id="orderInput" type="text" placeholder="输入「确认下单」把推荐加入购物车，或直接和我对话" onkeydown="if(event.key==='Enter')sendCustom()" />
+                <button id="orderSendBtn" onclick="sendCustom()">发送</button>
             </div>
         </div>
     </div>
@@ -584,6 +635,236 @@
                 loadingBubble.parentElement.classList.remove('loading');
                 loadingBubble.parentElement.classList.add('error');
             }
+        }
+
+        // ========== 确认下单 & 自然语言加购：对话意图触发 ==========
+        // 两种加购入口，前端按意图关键词路由：
+        //   1) 确认下单（整批推荐）：用户说"确认下单/就这些/下单吧"
+        //      → 从最近推荐气泡提取菜名 → /api/dish/resolve 反查 → /api/cart/batch-add
+        //   2) 自然语言加购（子 Agent）：用户说"来份XXX加购/把XXX加到购物车"
+        //      → /api/cart/agent-chat（CartAgent 用 LLM 提取菜名+数量 → 加购）
+        // 收钱吧网关未通时后端自动 mock 成功，保证链路可演示。
+        const ORDER_CONFIRM_KEYWORDS = ['确认下单', '就这些', '帮我下单', '确认点单', '就点这些', '下单吧'];
+        const ADD_CART_KEYWORDS = ['加购', '购物车', '加到购物车', '加入购物车'];
+        const ORDER_API_RESOLVE = '/api/dish/resolve';
+        const ORDER_API_BATCH = '/api/cart/batch-add';
+        const CART_AGENT_API = '/api/cart/agent-chat';
+
+        function isConfirmOrderIntent(text) {
+            const t = text.trim();
+            return ORDER_CONFIRM_KEYWORDS.some(kw => t.includes(kw));
+        }
+
+        function isAddToCartIntent(text) {
+            const t = text.trim();
+            return ADD_CART_KEYWORDS.some(kw => t.includes(kw));
+        }
+
+        // 从最近一条含菜品的推荐气泡提取菜名（.r-name 文本）
+        function extractDishNamesFromLastRecommend() {
+            const msgs = chatArea.querySelectorAll('.msg.assistant');
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const dishes = msgs[i].querySelectorAll('.r-dish .r-name');
+                if (dishes.length > 0) {
+                    return Array.from(dishes).map(el => el.textContent.trim()).filter(Boolean);
+                }
+            }
+            return [];
+        }
+
+        async function sendCustom() {
+            const input = document.getElementById('orderInput');
+            const text = input.value.trim();
+            if (!text) return;
+            appendMessage('user', text);
+            input.value = '';
+
+            if (isConfirmOrderIntent(text)) {
+                await confirmOrder();
+            } else if (isAddToCartIntent(text)) {
+                await addByTextOrder(text);
+            } else {
+                await sendChat(text);
+            }
+        }
+
+        // 普通对话发送（复用 /api/ai/chat）
+        async function sendChat(message) {
+            const loadingBubble = appendMessage('loading', '正在思考...');
+            try {
+                const resp = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_message: message,
+                        session_id: sessionId,
+                        session_token: sessionToken
+                    })
+                });
+                if (resp.status === 401) {
+                    sessionId = ''; sessionToken = '';
+                    loadingBubble.textContent = '会话已过期，请重新推荐';
+                    loadingBubble.parentElement.classList.remove('loading');
+                    loadingBubble.parentElement.classList.add('error');
+                    return;
+                }
+                if (!resp.ok) {
+                    loadingBubble.textContent = `请求失败 (HTTP ${resp.status})`;
+                    loadingBubble.parentElement.classList.remove('loading');
+                    loadingBubble.parentElement.classList.add('error');
+                    return;
+                }
+                const data = await resp.json();
+                if (data.session_id) sessionId = data.session_id;
+                if (data.session_token) sessionToken = data.session_token;
+                const content = data.aimessage || data.content || data.message || '';
+                loadingBubble.innerHTML = formatAssistantHtml(String(content));
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('assistant');
+            } catch (err) {
+                loadingBubble.textContent = '网络错误：' + err.message;
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('error');
+            }
+        }
+
+        // 自然语言加购：调加购子 Agent，LLM 提取菜名+数量 → 批量加购
+        async function addByTextOrder(text) {
+            if (!sessionId || !sessionToken) {
+                appendMessage('assistant', '会话已过期，请重新推荐后再下单。');
+                return;
+            }
+            const loadingBubble = appendMessage('loading', '加购助手正在识别菜品...');
+            try {
+                const resp = await fetch(CART_AGENT_API, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_message: text,
+                        session_id: sessionId,
+                        session_token: sessionToken
+                    })
+                });
+                if (resp.status === 401) {
+                    sessionId = ''; sessionToken = '';
+                    loadingBubble.textContent = '会话已过期，请重新推荐后再下单';
+                    loadingBubble.parentElement.classList.remove('loading');
+                    loadingBubble.parentElement.classList.add('error');
+                    return;
+                }
+                if (!resp.ok) {
+                    const errText = await resp.text().catch(() => '无错误详情');
+                    throw new Error(`加购失败 (HTTP ${resp.status})：${errText}`);
+                }
+                const data = await resp.json();
+                const cartResult = data.cart_result || {};
+                const content = data.aimessage || '';
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('assistant');
+                // 有加购结果 → 渲染结构化气泡；否则纯文本展示（未识别等情况）
+                if (cartResult && (cartResult.success_count || cartResult.results)) {
+                    loadingBubble.innerHTML = renderCartResultFromAgent(content, cartResult);
+                } else {
+                    loadingBubble.innerHTML = formatAssistantHtml(content);
+                }
+            } catch (err) {
+                let errMsg = err.message;
+                if (errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError')) {
+                    errMsg = '网络连接失败，请检查后端服务是否启动';
+                }
+                loadingBubble.textContent = errMsg;
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('error');
+            }
+        }
+
+        // 渲染加购子 Agent 的结果（自然语言回复 + 结构化加购明细）
+        function renderCartResultFromAgent(content, cartResult) {
+            const ok = (cartResult.code === 200) && (cartResult.mocked || cartResult.failed_count === 0);
+            const cls = ok ? 'r-cart' : 'r-cart-fail';
+            const lines = [`<div class="${cls}">${escapeHtml(content)}</div>`];
+            return lines.join('');
+        }
+
+        async function confirmOrder() {
+            const dishNames = extractDishNamesFromLastRecommend();
+            if (dishNames.length === 0) {
+                appendMessage('assistant', '还没有可下单的推荐，请先让 AI 推荐菜品~');
+                return;
+            }
+            if (!sessionId || !sessionToken) {
+                appendMessage('assistant', '会话已过期，请重新推荐后再下单。');
+                return;
+            }
+
+            const loadingBubble = appendMessage('loading', `正在把 ${dishNames.length} 道菜加入购物车...`);
+
+            try {
+                // 第一步：菜名反查 id
+                const resolveResp = await fetch(ORDER_API_RESOLVE, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        dish_names: dishNames,
+                        session_id: sessionId,
+                        session_token: sessionToken
+                    })
+                });
+                if (resolveResp.status === 401) {
+                    sessionId = ''; sessionToken = '';
+                    loadingBubble.textContent = '会话已过期，请重新推荐后再下单';
+                    loadingBubble.parentElement.classList.remove('loading');
+                    loadingBubble.parentElement.classList.add('error');
+                    return;
+                }
+                if (!resolveResp.ok) throw new Error(`反查失败 (HTTP ${resolveResp.status})`);
+                const resolveData = await resolveResp.json();
+                const dishes = resolveData.dishes || [];
+                const missing = resolveData.missing || [];
+                if (dishes.length === 0) throw new Error('未能反查到任何菜品 id');
+
+                // 第二步：批量加购（方案 A：skuId = goodsId = id）
+                const items = dishes.map(d => ({
+                    goodsId: d.id, skuId: d.id, goodsName: d.name, goodsNum: 1
+                }));
+                const batchResp = await fetch(ORDER_API_BATCH, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        items: items,
+                        session_id: sessionId,
+                        session_token: sessionToken
+                    })
+                });
+                if (!batchResp.ok) throw new Error(`加购失败 (HTTP ${batchResp.status})`);
+                const batchData = await batchResp.json();
+
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('assistant');
+                loadingBubble.innerHTML = renderCartResult(dishes, missing, batchData);
+            } catch (err) {
+                loadingBubble.textContent = '加购失败：' + err.message;
+                loadingBubble.parentElement.classList.remove('loading');
+                loadingBubble.parentElement.classList.add('error');
+            }
+        }
+
+        function renderCartResult(dishes, missing, batchData) {
+            const ok = (batchData.code === 200) && (batchData.mocked || batchData.failed_count === 0);
+            const cls = ok ? 'r-cart' : 'r-cart-fail';
+            const title = batchData.mocked
+                ? `已加入购物车（演示模式·收钱吧网关未通）`
+                : (ok ? `已加入购物车` : `部分加入购物车`);
+            const lines = [`<div class="${cls}"><div style="font-weight:600;margin-bottom:6px;">${escapeHtml(title)}</div>`];
+            dishes.forEach(d => {
+                lines.push(`<div class="r-cart-item"><span>${escapeHtml(d.name)}</span><span>￥${escapeHtml(String(d.price))}</span></div>`);
+            });
+            if (missing.length > 0) {
+                lines.push(`<div style="margin-top:6px;color:#e67e22;font-size:12px;">未识别菜品：${escapeHtml(missing.join('、'))}</div>`);
+            }
+            lines.push(`<div style="margin-top:6px;font-size:12px;opacity:0.8;">成功 ${batchData.success_count}/${dishes.length} 道</div>`);
+            lines.push('</div>');
+            return lines.join('');
         }
 
         async function resetAll() {

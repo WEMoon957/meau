@@ -65,6 +65,7 @@ except ImportError:
     pass
 
 from agent import OrderingAgent, AgentError
+from cart_agent import CartAgent, CartAgentError
 from menu_data import get_all_dishes
 import rate_limiter
 from rate_limiter import (
@@ -95,6 +96,7 @@ REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
 _chat_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHATS)
 _session_manager: SessionManager | None = None
+_cart_agent: CartAgent | None = None
 _cleanup_task: asyncio.Task | None = None
 _limiter_cleanup_task: asyncio.Task | None = None
 _redis_client = None
@@ -128,6 +130,19 @@ def _create_agent() -> OrderingAgent:
     return OrderingAgent(api_key=api_key, model=DEFAULT_MODEL, base_url=base_url)
 
 
+def _create_cart_agent() -> CartAgent:
+    """创建加购子 Agent（复用 OrderingAgent 的 LLM 配置）"""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    base_url = os.environ.get("OPENAI_BASE_URL", "")
+    return CartAgent(api_key=api_key, model=DEFAULT_MODEL, base_url=base_url)
+
+
+def get_cart_agent() -> CartAgent:
+    if _cart_agent is None:
+        raise RuntimeError("CartAgent 尚未初始化")
+    return _cart_agent
+
+
 def get_session_manager() -> SessionManager:
     if _session_manager is None:
         raise RuntimeError("SessionManager 尚未初始化")
@@ -136,7 +151,7 @@ def get_session_manager() -> SessionManager:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _session_manager, _cleanup_task, _limiter_cleanup_task, _redis_client
+    global _session_manager, _cart_agent, _cleanup_task, _limiter_cleanup_task, _redis_client
 
     # 1. Redis（多 worker 共享会话/限流的前提）
     _redis_client = _create_redis_client()
@@ -147,6 +162,8 @@ async def lifespan(_app: FastAPI):
     # 3. 共享无状态 Agent + 会话管理器
     agent = _create_agent()
     _session_manager = SessionManager(agent, redis_client=_redis_client)
+    # 加购子 Agent（与 OrderingAgent 平行，复用同一 LLM 配置）
+    _cart_agent = _create_cart_agent()
 
     # 4. 预热数据
     get_all_dishes()
@@ -649,6 +666,163 @@ async def cart_add(request: _CartAddRequest, http_request: Request):
     # C2 购物车限流：阈值比对话接口更严（上游网关有调用成本）
     _check_cart_rate_limit(http_request, request.session_id)
     return await _add_to_cart(request)
+
+
+# ======================== 确认下单：菜名反查 id + 批量加购 ========================
+# 用户在对话中说"确认下单"后，前端先解析推荐文本里的菜名，调 /api/dish/resolve
+# 反查菜品 id（加购接口必须传 goodsId/skuId），再调 /api/cart/batch-add 一次性加入购物车。
+# 收钱吧网关目前返回 404，batch-add 在真实调用全部失败时降级为 mock 成功。
+from cart_api import (  # noqa: E402
+    BatchCartAddRequest as _BatchCartAddRequest,
+    BatchCartAddResponse as _BatchCartAddResponse,
+    batch_add_to_cart as _batch_add_to_cart,
+)
+from menu_data import find_dish_by_name as _find_dish_by_name  # noqa: E402
+
+
+class DishResolveRequest(BaseModel):
+    """菜名反查 id 请求（前端从推荐文本解析出菜名后调用）"""
+    dish_names: list[str] = Field(..., min_length=1, max_length=30)
+    session_id: str = Field(..., min_length=1, max_length=64)
+    session_token: str = Field(..., min_length=1, max_length=128)
+
+
+class DishResolveItem(BaseModel):
+    id: int
+    name: str
+    price: float
+    category: str = ""
+    spicy_level: str = ""
+
+
+class DishResolveResponse(BaseModel):
+    code: int
+    msg: str
+    dishes: list[DishResolveItem] = []
+    missing: list[str] = []
+
+
+@app.post("/api/dish/resolve", response_model=DishResolveResponse)
+async def dish_resolve(request: DishResolveRequest, http_request: Request):
+    """菜名 → 菜品 id 反查（确认下单流程第一步）
+
+    前端从推荐文本解析出菜名后，调本接口拿到 goodsId(=Dish.id)，
+    再组装成批量加购请求。复用 menu_data 内存索引，O(1) 精确/模糊匹配。
+
+    安全：会话鉴权 require_existing=True + 购物车限流。
+    """
+    _verify_session_access(
+        request.session_id, request.session_token, require_existing=True
+    )
+    _check_cart_rate_limit(http_request, request.session_id)
+
+    dishes: list[DishResolveItem] = []
+    missing: list[str] = []
+    for name in request.dish_names:
+        d = _find_dish_by_name(name)
+        if d is not None:
+            dishes.append(DishResolveItem(
+                id=d.id, name=d.name, price=d.price,
+                category=d.category, spicy_level=d.spicy_level,
+            ))
+        else:
+            missing.append(name)
+    return {
+        "code": 200,
+        "msg": "success",
+        "dishes": dishes,
+        "missing": missing,
+    }
+
+
+@app.post("/api/cart/batch-add", response_model=_BatchCartAddResponse)
+async def cart_batch_add(request: _BatchCartAddRequest, http_request: Request):
+    """批量加入购物车（确认下单流程第二步）
+
+    前端把反查到的菜品 id 组装成 items 后一次性提交。后端逐个调用收钱吧网关，
+    全部失败时降级为 mock 成功（mocked=True），保证推荐→确认→加购链路可演示。
+
+    安全：会话鉴权 require_existing=True + 购物车限流。
+    """
+    _verify_session_access(
+        request.session_id, request.session_token, require_existing=True
+    )
+    _check_cart_rate_limit(http_request, request.session_id)
+    return await _batch_add_to_cart(request)
+
+
+# ======================== 加购子 Agent：自然语言加购 ========================
+# 用户用自然语言说要加什么菜（如"来份菌汤生态鸡子母锅和两份单点绣球菌加购"），
+# CartAgent 用 LLM 提取菜名+数量 → 反查 id → 同步批量加购。
+# 与 OrderingAgent（推荐/对话）平行，前端按意图路由：含"加购/购物车"走本接口。
+
+class CartAgentChatRequest(BaseModel):
+    """自然语言加购请求"""
+    user_message: str = Field(..., min_length=1, max_length=500,
+                              description="用户自然语言，如'来份菌汤生态鸡子母锅加购'")
+    session_id: str = Field(..., min_length=1, max_length=64)
+    session_token: str = Field(..., min_length=1, max_length=128)
+
+
+class CartAgentChatResponse(BaseModel):
+    code: int
+    msg: str
+    aimessage: str = ""
+    cart_result: dict | None = None
+    session_id: str = ""
+
+
+@app.post("/api/cart/agent-chat", response_model=CartAgentChatResponse)
+async def cart_agent_chat(request: CartAgentChatRequest, http_request: Request):
+    """自然语言加购 - 由加购子 Agent 处理
+
+    流程：CartAgent.chat(用户输入) → LLM 提取菜名 → 反查 id → 同步加购 → 自然语言回复
+
+    安全：会话鉴权 require_existing=True + 购物车限流（与 /api/cart/add 一致）。
+    并发：复用 _chat_semaphore，与对话接口共享并发上限，防 LLM 调用堆积。
+    """
+    session_id, _ = _verify_session_access(
+        request.session_id, request.session_token, require_existing=True
+    )
+    _check_cart_rate_limit(http_request, session_id)
+
+    if _chat_semaphore.locked():
+        raise HTTPException(
+            status_code=503,
+            detail="服务繁忙，请稍后重试",
+            headers={"Retry-After": "5"},
+        )
+
+    try:
+        async with _chat_semaphore:
+            # CartAgent.chat 为同步阻塞（LLM + 同步加购），放线程池执行
+            reply, cart_result = await asyncio.to_thread(
+                get_cart_agent().chat,
+                request.user_message.strip(),
+                session_id,
+                request.session_token,
+            )
+        return {
+            "code": 200,
+            "msg": "success",
+            "aimessage": reply,
+            "cart_result": cart_result or None,
+            "session_id": session_id,
+        }
+    except HTTPException:
+        raise
+    except CartAgentError as e:
+        logger.warning("cart_agent 处理失败 session_id=%s: %s", session_id, e)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logger.exception("cart_agent 处理失败 session_id=%s", session_id)
+        if _LLM_UPSTREAM_EXC and isinstance(e, _LLM_UPSTREAM_EXC):
+            raise HTTPException(
+                status_code=503,
+                detail="加购助手繁忙，请稍后重试",
+                headers={"Retry-After": "5"},
+            )
+        raise HTTPException(status_code=500, detail="加购服务内部错误，请稍后重试")
 
 
 # 前端静态文件
