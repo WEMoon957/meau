@@ -9,6 +9,13 @@ import sys
 import json
 import pymysql
 
+# 加载 .env 环境变量（云数据库配置等）
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
+except ImportError:
+    pass
+
 # 将当前目录加入路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
