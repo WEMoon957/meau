@@ -4,6 +4,11 @@
 
 FROM python:3.11-slim
 
+# 国内镜像源加速（apt 用阿里云 Debian 源，pip 用清华 PyPI 源）
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+    || sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null \
+    || true
+
 # 系统依赖：
 #   - libmysqlclient-dev / pkg-config：pymysql 编译/运行
 #   - default-libmysqlclient-dev：DBUtils 直连 MySQL 客户端
@@ -11,7 +16,9 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
