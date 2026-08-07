@@ -103,50 +103,62 @@ class OrderingAgent:
 
         self.history: list = []
 
+    def _build_response(self, result: dict, user_input: str) -> str:
+        """从 Agent 执行结果中提取最终回复（防幻觉策略：优先使用工具返回内容）"""
+        messages_out = result.get("messages", [])
+        if not messages_out:
+            return "抱歉，未能理解您的请求。"
+
+        # 防幻觉核心策略：优先使用工具返回的内容，而非AI复述
+        # 收集所有ToolMessage的内容
+        tool_contents = []
+        for msg in messages_out:
+            if isinstance(msg, ToolMessage) and msg.content:
+                tool_contents.append(msg.content)
+
+        ai_message = messages_out[-1]
+        response = ai_message.content
+        if isinstance(response, list):
+            text_parts = [
+                p.get("text", "") for p in response
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            response = "".join(text_parts).strip()
+
+        # 如果有工具调用结果，优先使用工具返回的内容
+        if tool_contents:
+            tool_result = tool_contents[-1]
+            # 检查AI回复是否与工具结果差异过大（AI可能编造了内容）
+            # 简单策略：如果工具结果较长（>50字符），直接使用工具结果
+            if len(tool_result) > 50:
+                response = tool_result
+            # 如果AI回复过短，也使用工具结果
+            elif len(response) < 20:
+                response = tool_result
+
+        self.history.append(HumanMessage(content=user_input))
+        self.history.append(AIMessage(content=response))
+
+        if len(self.history) > self.MAX_HISTORY:
+            self.history = self.history[-self.MAX_HISTORY:]
+
+        return response
+
     def chat(self, user_input: str) -> str:
-        """处理用户输入并返回回复"""
+        """处理用户输入并返回回复（同步，供 CLI 使用）"""
         try:
             messages = self.history + [HumanMessage(content=user_input)]
             result = self.graph.invoke({"messages": messages})
+            return self._build_response(result, user_input)
+        except Exception as e:
+            return f"处理请求时出错: {e}，请重试。"
 
-            messages_out = result.get("messages", [])
-            if not messages_out:
-                return "抱歉，未能理解您的请求。"
-
-            # 防幻觉核心策略：优先使用工具返回的内容，而非AI复述
-            # 收集所有ToolMessage的内容
-            tool_contents = []
-            for msg in messages_out:
-                if isinstance(msg, ToolMessage) and msg.content:
-                    tool_contents.append(msg.content)
-
-            ai_message = messages_out[-1]
-            response = ai_message.content
-            if isinstance(response, list):
-                text_parts = [
-                    p.get("text", "") for p in response
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ]
-                response = "".join(text_parts).strip()
-
-            # 如果有工具调用结果，优先使用工具返回的内容
-            if tool_contents:
-                tool_result = tool_contents[-1]
-                # 检查AI回复是否与工具结果差异过大（AI可能编造了内容）
-                # 简单策略：如果工具结果较长（>50字符），直接使用工具结果
-                if len(tool_result) > 50:
-                    response = tool_result
-                # 如果AI回复过短，也使用工具结果
-                elif len(response) < 20:
-                    response = tool_result
-
-            self.history.append(HumanMessage(content=user_input))
-            self.history.append(AIMessage(content=response))
-
-            if len(self.history) > self.MAX_HISTORY:
-                self.history = self.history[-self.MAX_HISTORY:]
-
-            return response
+    async def achat(self, user_input: str) -> str:
+        """处理用户输入并返回回复（异步，供 API 使用，突破线程池瓶颈）"""
+        try:
+            messages = self.history + [HumanMessage(content=user_input)]
+            result = await self.graph.ainvoke({"messages": messages})
+            return self._build_response(result, user_input)
         except Exception as e:
             return f"处理请求时出错: {e}，请重试。"
 

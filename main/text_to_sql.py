@@ -6,6 +6,7 @@
 流程：自然语言 → LLM 生成 SQL → 安全校验 → 执行查询 → 格式化结果
 """
 
+import asyncio
 import os
 import re
 import pymysql
@@ -129,6 +130,20 @@ def generate_sql(question: str) -> str:
 
     sql = response.content.strip()
     # 去除可能的 markdown 代码块标记
+    sql = re.sub(r'^```(?:sql)?\s*', '', sql)
+    sql = re.sub(r'\s*```$', '', sql)
+    return sql.strip().rstrip(";")
+
+
+async def agenerate_sql(question: str) -> str:
+    """generate_sql 的异步版本（供 async 工具调用，突破线程池瓶颈）"""
+    llm = _get_llm()
+    response = await llm.ainvoke([
+        SystemMessage(content=SQL_SYSTEM_PROMPT),
+        HumanMessage(content=question),
+    ])
+
+    sql = response.content.strip()
     sql = re.sub(r'^```(?:sql)?\s*', '', sql)
     sql = re.sub(r'\s*```$', '', sql)
     return sql.strip().rstrip(";")
@@ -302,6 +317,81 @@ def list_menu_dishes(category: str = "") -> str:
         return f"数据库查询失败: {e}"
 
     # 4. 格式化结果
+    if not dishes:
+        if category:
+            return f"没有找到分类「{category}」的菜品，可选分类：凉菜/热菜/汤品/主食/饮品/甜点"
+        return "菜单暂无菜品。"
+
+    lines = [f"{title}（共{len(dishes)}道）:\n"]
+    current_cat = ""
+    for d in dishes:
+        if d.category != current_cat:
+            current_cat = d.category
+            lines.append(f"\n--- {current_cat} ---")
+        sig = " ★" if d.is_signature else ""
+        spicy = f" [{d.spicy_level}]" if d.spicy_level != "不辣" else ""
+        lines.append(f"  {d.name}  ￥{d.price}{spicy}{sig}")
+    return "\n".join(lines)
+
+
+# ======================== 异步高层接口（供 async 工具调用） ========================
+async def aquery_dish_by_name(dish_name: str) -> str:
+    """query_dish_by_name 的异步版本"""
+    question = f"查找名为{dish_name}的菜品，精确匹配不到时用名称模糊匹配，最多返回5条"
+
+    try:
+        sql = await agenerate_sql(question)
+    except Exception as e:
+        return f"SQL 生成失败: {e}"
+
+    is_valid, error = validate_sql(sql)
+    if not is_valid:
+        return f"SQL 校验失败: {error}"
+
+    try:
+        # pymysql 是同步库，用 to_thread 避免阻塞事件循环
+        dishes = await asyncio.to_thread(execute_sql, sql)
+    except Exception as e:
+        return f"数据库查询失败: {e}"
+
+    if not dishes:
+        return f"未找到菜品「{dish_name}」，请确认菜品名称。"
+
+    if len(dishes) == 1:
+        return format_dish_info(dishes[0])
+
+    lines = [f"找到 {len(dishes)} 道相关菜品：\n"]
+    for d in dishes:
+        sig = " ★" if d.is_signature else ""
+        spicy = f" [{d.spicy_level}]" if d.spicy_level != "不辣" else ""
+        lines.append(f"  {d.name}  ￥{d.price} ({d.category}){spicy}{sig}")
+    lines.append(f"\n如需查看某道菜的详细信息，请告诉我菜品名称。")
+    return "\n".join(lines)
+
+
+async def alist_menu_dishes(category: str = "") -> str:
+    """list_menu_dishes 的异步版本"""
+    if category:
+        question = f"查找所有分类为{category}的菜品，按id排序"
+        title = f"分类: {category}菜单"
+    else:
+        question = "查找所有菜品，按分类和id排序"
+        title = "全部菜单"
+
+    try:
+        sql = await agenerate_sql(question)
+    except Exception as e:
+        return f"SQL 生成失败: {e}"
+
+    is_valid, error = validate_sql(sql)
+    if not is_valid:
+        return f"SQL 校验失败: {error}"
+
+    try:
+        dishes = await asyncio.to_thread(execute_sql, sql)
+    except Exception as e:
+        return f"数据库查询失败: {e}"
+
     if not dishes:
         if category:
             return f"没有找到分类「{category}」的菜品，可选分类：凉菜/热菜/汤品/主食/饮品/甜点"

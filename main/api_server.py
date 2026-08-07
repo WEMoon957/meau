@@ -197,7 +197,7 @@ async def ai_chat(request: ChatRequest, http_request: Request):
 
     try:
         async with _chat_semaphore:
-            aimessage = await asyncio.to_thread(agent.chat, request.message.strip())
+            aimessage = await agent.achat(request.message.strip())
         manager.touch(session_id)
         return {
             "code": 200,

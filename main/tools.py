@@ -158,7 +158,7 @@ def _category_quota(people_count: int) -> dict[str, int]:
 # ======================== LangChain 工具定义 ========================
 
 @tool
-def query_dish(dish_name: str) -> str:
+async def query_dish(dish_name: str) -> str:
     """查询菜品详细信息，包括价格、辣度、适合人群、过敏原、饮食标签等。当顾客询问某道菜的具体信息时使用。
 
     使用 Text-to-SQL 技术：LLM 根据菜品名称生成 SQL 查询数据库，精确匹配优先，模糊匹配兜底。
@@ -166,12 +166,12 @@ def query_dish(dish_name: str) -> str:
     Args:
         dish_name: 菜品名称，如：宫保鸡丁、水煮鱼
     """
-    from text_to_sql import query_dish_by_name
-    return query_dish_by_name(dish_name)
+    from text_to_sql import aquery_dish_by_name
+    return await aquery_dish_by_name(dish_name)
 
 
 @tool
-def list_menu(category: str = "") -> str:
+async def list_menu(category: str = "") -> str:
     """列出菜单菜品，可按分类筛选。当顾客想看菜单或浏览某类菜品时使用。
 
     使用 Text-to-SQL 技术：LLM 根据分类生成 SQL 查询数据库。
@@ -179,12 +179,12 @@ def list_menu(category: str = "") -> str:
     Args:
         category: 菜品分类：凉菜/热菜/汤品/主食/饮品/甜点，为空则列出全部
     """
-    from text_to_sql import list_menu_dishes
-    return list_menu_dishes(category)
+    from text_to_sql import alist_menu_dishes
+    return await alist_menu_dishes(category)
 
 
 @tool
-def recommend_dishes(
+async def recommend_dishes(
     people_count: int = 0,
     taste: str = "",
     customer_type: str = "",
@@ -307,7 +307,7 @@ def recommend_dishes(
 
 
 @tool
-def add_to_cart(dish_name: str, quantity: int = 1) -> str:
+async def add_to_cart(dish_name: str, quantity: int = 1) -> str:
     """将菜品加入购物车。当顾客确认要点某道菜时使用。
 
     Args:
@@ -321,7 +321,7 @@ def add_to_cart(dish_name: str, quantity: int = 1) -> str:
 
 
 @tool
-def quick_add_from_category(category: str) -> str:
+async def quick_add_from_category(category: str) -> str:
     """从指定分类中直接选一道菜加入购物车。当顾客说"来个喝的就行""随便来个汤""来个主食"等不需要指定具体菜品时使用。
 
     Args:
@@ -340,7 +340,7 @@ def quick_add_from_category(category: str) -> str:
 
 
 @tool
-def remove_from_cart(dish_name: str) -> str:
+async def remove_from_cart(dish_name: str) -> str:
     """从购物车移除菜品。当顾客想取消某道菜时使用。
 
     Args:
@@ -350,13 +350,13 @@ def remove_from_cart(dish_name: str) -> str:
 
 
 @tool
-def get_cart() -> str:
+async def get_cart() -> str:
     """查看当前购物车内容和总价。当顾客想查看已选菜品时使用。"""
     return _get_session_cart().get_summary()
 
 
 @tool
-def checkout() -> str:
+async def checkout() -> str:
     """结算下单。当顾客确认要下单时使用，会清空购物车。"""
     session_cart = _get_session_cart()
     if session_cart.is_empty():
@@ -369,7 +369,7 @@ def checkout() -> str:
 # ======================== 服务员话术工具 ========================
 
 @tool
-def generate_server_script(scene: str, script_type: str = "") -> str:
+async def generate_server_script(scene: str, script_type: str = "") -> str:
     """根据场景从话术向量库中检索并生成服务员话术。必须在此类场景下使用本工具，禁止自行编造回答：
     - 顾客嫌菜太辣/太咸/不好吃等客诉应对
     - 顾客带小孩/老人来用餐的推荐
@@ -383,9 +383,9 @@ def generate_server_script(scene: str, script_type: str = "") -> str:
         scene: 场景描述，如"顾客带小孩来用餐""顾客嫌菜太辣""推荐招牌菜""四个人聚餐怎么推荐"
         script_type: 话术类型筛选（可选）：selling_point(菜品卖点)/scene(场景应对)/pairing(搭配推荐)/exception(异常处理)
     """
-    from vector_store import search_scripts
+    from vector_store import asearch_scripts
 
-    results = search_scripts(scene, k=3, script_type=script_type if script_type else None)
+    results = await asearch_scripts(scene, k=3, script_type=script_type if script_type else None)
 
     if not results:
         return "暂未找到匹配的话术，请尝试换个描述。"
@@ -400,7 +400,7 @@ def generate_server_script(scene: str, script_type: str = "") -> str:
 
 
 @tool
-def add_custom_script(content: str, script_type: str = "custom", dish_name: str = "", scene: str = "") -> str:
+async def add_custom_script(content: str, script_type: str = "custom", dish_name: str = "", scene: str = "") -> str:
     """添加自定义话术到话术向量库，供后续检索使用。当服务员或店长想补充新的话术时使用。
 
     Args:
@@ -409,9 +409,9 @@ def add_custom_script(content: str, script_type: str = "custom", dish_name: str 
         dish_name: 关联的菜品名称（可选）
         scene: 场景描述（可选）
     """
-    from vector_store import add_script
+    from vector_store import aadd_script
 
-    return add_script(content, script_type, dish_name, scene)
+    return await aadd_script(content, script_type, dish_name, scene)
 
 
 # 所有工具列表（供 Agent 使用）

@@ -3,6 +3,7 @@
 启动交互式对话，实现：用户提问 -> AI理解 -> 推荐菜品 -> 辅助下单
 """
 
+import asyncio
 import os
 import sys
 import io
@@ -43,7 +44,7 @@ BANNER = """
 """
 
 
-def main():
+async def main():
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         print("未检测到 OPENAI_API_KEY 环境变量")
@@ -62,6 +63,7 @@ def main():
 
     while True:
         try:
+            # CLI 单用户场景，input 阻塞事件循环可接受
             user_input = input("\n您: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\n感谢使用，再见！")
@@ -81,7 +83,7 @@ def main():
 
         if user_input in ("菜单", "menu"):
             from tools import list_menu
-            print(f"\n小味: {list_menu.invoke({'category': ''})}")
+            print(f"\n小味: {await list_menu.ainvoke({'category': ''})}")
             continue
 
         if user_input == "话术":
@@ -111,7 +113,7 @@ def main():
             continue
 
         try:
-            reply = agent.chat(user_input)
+            reply = await agent.achat(user_input)
             print(f"\n小味: {reply}")
         except Exception as e:
             print(f"\n处理请求时出错: {e}")
@@ -119,4 +121,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

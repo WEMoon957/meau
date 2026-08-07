@@ -7,6 +7,7 @@
 4. 持久化：向量库保存在本地磁盘，重启不丢失
 """
 
+import asyncio
 import os
 import sys
 
@@ -203,6 +204,60 @@ def add_script(content: str, script_type: str = "custom",
     vector_store.add_documents([doc])
 
     return f"已添加自定义话术（ID: {script['id']}）"
+
+
+# ======================== 异步接口（供 async 工具调用） ========================
+async def asearch_scripts(query: str, k: int = 3, script_type: str = None) -> list[dict]:
+    """search_scripts 的异步版本
+
+    Chroma 的同步 API 用 to_thread 包装，避免阻塞事件循环。
+    Embedding 调用（DashScope 远程 API）是真正的 I/O 等待点。
+    """
+    def _search():
+        vector_store = build_vector_store()
+
+        filter_dict = None
+        if script_type:
+            filter_dict = {"type": script_type}
+
+        results = vector_store.similarity_search_with_relevance_scores(
+            query, k=k, filter=filter_dict
+        )
+
+        output = []
+        for doc, score in results:
+            output.append({
+                "content": doc.page_content,
+                "score": round(score, 3),
+                "metadata": doc.metadata,
+            })
+        return output
+
+    return await asyncio.to_thread(_search)
+
+
+async def aadd_script(content: str, script_type: str = "custom",
+                     dish_name: str = "", scene: str = "") -> str:
+    """add_script 的异步版本"""
+    def _add():
+        from langchain_core.documents import Document
+        script = add_custom_script(content, script_type, dish_name, scene)
+
+        vector_store = build_vector_store()
+        doc = Document(
+            page_content=script["content"],
+            metadata={
+                "script_id": script["id"],
+                "type": script["type"],
+                "dish_name": script.get("dish_name", ""),
+                **script.get("metadata", {}),
+            }
+        )
+        vector_store.add_documents([doc])
+
+        return f"已添加自定义话术（ID: {script['id']}）"
+
+    return await asyncio.to_thread(_add)
 
 
 def get_vector_store_info() -> dict:
