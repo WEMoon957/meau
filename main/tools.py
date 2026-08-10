@@ -621,7 +621,9 @@ def recommend_dishes(
     exclude_set = {x.strip() for x in _parse_csv(exclude_dishes) if x.strip()}
     
     # ========== 基础筛选 ==========
-    
+    # 推荐总数（提前计算，供软筛选候选不足兜底使用）
+    total_quota = _total_quota(people_count)
+
     # 1. 口味筛选（带渐进降级：特辣→中辣→微辣→不限）
     original_taste = taste
     candidates = _filter_by_taste(candidates, taste)
@@ -641,19 +643,27 @@ def recommend_dishes(
         candidates = list(all_dishes)
         taste = ""
     
-    # 2. 人群筛选
+    # 2. 人群筛选（带兜底：候选不足时放宽人群硬筛选；场景过滤仍防止儿童餐泄漏）
     candidates = _filter_by_customer_type(candidates, customer_type)
-    
+    if len(candidates) < total_quota:
+        # 数据稀疏（如"孕妇"适合人群标注为 0 道）时放宽人群限制，避免推荐只剩锅底
+        candidates = _filter_by_customer_type(list(all_dishes), "")
+
     # 3. 场景过滤（儿童餐等）
     candidates = _filter_by_scene(candidates, customer_type)
 
     # 3.5. 按人数过滤多人份拼盘（四人拼盘至少3人，双人拼盘至少2人）
     candidates = _filter_by_party_size(candidates, people_count)
-    
-    # 4. 健康标签筛选
+
+    # 4. 健康标签筛选（多标签 OR 语义 + 兜底：候选不足时忽略健康限制）
     if health_tags:
-        for tag in _parse_csv(health_tags):
-            candidates = [d for d in candidates if tag in d.dietary_tags]
+        pre_health = candidates
+        tags = _parse_csv(health_tags)
+        candidates = [d for d in candidates
+                      if any(tag in d.dietary_tags for tag in tags)]
+        if len(candidates) < total_quota:
+            # 数据稀疏（如"高蛋白"标注为 0 道）时忽略健康限制，避免推荐只剩锅底
+            candidates = pre_health
     
     # 5. 过敏原排除
     candidates = _filter_by_allergens(candidates, avoid_list)
@@ -677,9 +687,7 @@ def recommend_dishes(
                       or (d.category == "菌汤锅底" and "锅" in d.name)]
     
     # ========== 推荐逻辑 ==========
-    
-    # 计算推荐数量
-    total_quota = _total_quota(people_count)
+
     recommended = []
     used_names = set()
     cat_count = {}

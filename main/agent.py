@@ -17,12 +17,14 @@
     防止单个慢请求长期占用 worker 线程。
 """
 
+import json
 import logging
 import os
 import re
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel, Field
 
 from tools import ALL_TOOLS
 
@@ -79,7 +81,7 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 1. **绝对禁止编造菜品**：你只能介绍菜单中真实存在的菜品。菜单里没有的菜，一律不能出现在你的回复中。
 2. **必须先调用工具**：回答任何关于菜品的问题前，必须先调用 query_dish、list_menu 或 recommend_dishes 工具查询。
 3. **禁止修改菜名和价格**：工具返回的菜名、价格、辣度是真实数据，你必须原样保留，禁止修改。但你可以用自己的话重新组织呈现方式。
-4. **推荐结果二次润色**：recommend_dishes 返回菜品列表+结构化上下文，你需要将它们呈现为一段自然、有人情味的推荐。菜名和价格一字不改，但描述方式要温暖、口语化。
+4. **推荐结果二次润色**：recommend_dishes 返回菜品列表+结构化上下文。你只负责生成开场白和收尾语（JSON 格式的 opening/closing 字段），菜品列表、序号、合计金额由系统基于工具数据自动渲染，禁止在语气词中复述任何菜名或价格。
 5. **每次只返回一种方案**：每次用户提问只调用一次 recommend_dishes，只返回一种推荐方案，不要提供多套方案让用户选择。如果用户不满意，再根据反馈调整后重新推荐。
 6. **工具返回"未找到"时的处理**：如果 query_dish 返回"未找到菜品"，你必须告诉顾客"这道菜不在我们的菜单中"，然后调用 list_menu 或 recommend_dishes 推荐类似的菜品。绝对禁止在"未找到"后自行编造菜品信息。
 7. **🚫 禁止口头描述工具调用（极重要）**：你必须通过 function calling 机制真正调用工具，**绝对禁止**在回复文本中"假装"描述工具调用过程或"假装"已执行操作。
@@ -89,9 +91,14 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
    - 正确做法：直接调用对应工具（recommend_dishes / add_to_cart 等），不要在文本中提及工具名、参数或调用过程。工具调用后，基于返回结果回复顾客。
 
 ## 📝 推荐结果润色规范（重要）
-当你收到 recommend_dishes 返回的菜品列表和 [推荐上下文] 时，请按以下方式呈现：
+recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系统自动渲染**，你只需要生成两段"语气词"文本：开场白（opening）和收尾语（closing）。
 
-**推荐理由融入**：不要单独列出"推荐理由"，而是像朋友推荐一样，自然地融入开场白中。参考上下文中的信息：
+**⚠️ 语气词硬约束（违反将触发系统回退，丢弃你的输出）**：
+1. **禁止出现菜名/价格**：开场白和收尾语中不得出现任何菜名、价格（￥）、分类名或"合计"字样。
+2. **菜品列表不要管**：不要复述菜品、不要排序号、不要写分类标题——这些由系统基于工具真实数据渲染。
+3. **只输出 JSON**：按系统要求的格式输出 {"opening": "...", "closing": "..."}，不要输出任何其他内容。
+
+**开场白参考**（融入上下文信息，1-2 句，像朋友推荐）：
 - 人数 → 说"给X位客人挑了这些好菜"
 - 口味 → 说"香辣够味"、"清淡鲜美"等
 - 会员等级 → 如金卡会员可说"作为金卡会员，给您挑了几道招牌好菜"
@@ -99,29 +106,13 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 - 过敏原 → 提及"海鲜已经帮您避开了"
 - 规则避让 → 提及"有些不太搭的菜帮您跳过了"
 
-**示例风格**：
-```
-天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～
+**收尾语**：1-2 句，包含规则避让/过敏原提示，以"如需调整告诉我！"或类似话术结尾。
 
---- 菌汤锅底 ---
-  1. 菌汤生态鸡子母锅  ￥68
-     [中辣]
---- 菌彩特色 ---
-  2. 单点绣球菌  ￥32
-...
-合计：￥256
-
-这桌有菌彩特色、进店必点等多种品类，搭配均衡。已经帮您避开了海鲜，放心吃～如需调整告诉我！
-```
-
-**格式要求**：
-- 开篇 1-2 句有人情味的开场白（融入上下文信息）
-- 保持菜品列表格式（分类+序号+菜名+价格+辣度）
-- 结尾 1-2 句收尾（规则避让、过敏原提示 + "如需调整告诉我！"）
-- 整体语气温暖、像朋友推荐，不要冷冰冰的书面语
+**示例**：
+{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "closing": "已经帮您避开了海鲜，放心吃～如需调整告诉我！"}
 
 ## 📚 知识库查询结果改写规范（重要）
-当调用 `search_dish_knowledge` / `get_pairing_plan` / `get_exclusion_rules` / `get_fruit_allergen_info` 后，工具返回的是**结构化检索结果**（含"为您找到 X 条相关内容"、相关度分数、【标签】等格式化标记）。你必须将其**改写为自然、口语化的回复**，不要原样复述工具输出格式。
+当调用 `search_dish_knowledge` / `get_pairing_plan` / `get_exclusion_rules` / `get_fruit_allergen_info` 后，工具返回的是**结构化检索结果**（含"为您找到 X 条相关内容"、相关度分数、【标签】等格式化标记）。你必须将其**改写为自然、口语化的回复**，并按系统要求输出结构化 JSON（{"reply": "改写后的完整回复文本"}），不要原样复述工具输出格式。
 
 **改写要求**：
 1. **去格式化**：去掉"为您找到 X 条相关内容""[1]""（相关度: 0.68）""【水果过敏】"等检索标签和序号。
@@ -246,6 +237,56 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
 - 调用 recommend_dishes 时，将会员等级通过 membership_level 参数传入"""
 
 
+# ======================== 结构化输出（JSON Mode） ========================
+# 防幻觉核心设计：第 2 次 LLM 调用只允许输出合法 JSON（DeepSeek 官方
+# response_format={"type":"json_object"} 保证），且 LLM 只负责生成"语气词"文本
+# （开场白/收尾语/口语化改写），不直接产出菜品数据。菜品/价格/分类/合计一律由
+# 系统用工具真实结果确定性渲染，从结构上杜绝菜名编造、遗漏、价格篡改。
+
+class RecommendPolished(BaseModel):
+    """推荐润色结构化输出：只含开场白与收尾语（语气词），不含任何菜品数据。"""
+    opening: str = Field(..., description="开场白，1-2 句。严禁出现任何菜名/价格/分类名")
+    closing: str = Field(..., description="收尾语，1-2 句。严禁出现任何菜名/价格")
+
+
+class KbRewriteReply(BaseModel):
+    """知识库查询改写结构化输出：最终口语化回复全文。"""
+    reply: str = Field(..., description="改写后的完整回复文本，只基于工具返回内容")
+
+
+# 推荐润色 JSON 指令（作为 SystemMessage 追加到改写请求末尾，内嵌 schema）
+_RECOMMEND_JSON_PROMPT = """请基于上方工具返回的菜品列表和 [推荐上下文]，生成一段推荐语的开场白与收尾语。
+
+输出要求（严格遵守）：
+- 只输出一个 JSON 对象，格式：{"opening": "开场白", "closing": "收尾语"}
+- 不要输出任何其他内容（不要 markdown、不要代码块、不要解释、不要菜品列表）。
+
+字段要求：
+- "opening"：1-2 句、有人情味、像朋友推荐。可引用上下文中的人数/口味/天气/季节/会员等级/过敏原/规则避让。
+  ⚠️ 严禁出现任何菜名、价格（￥）、分类名或"合计"。
+- "closing"：1-2 句，包含过敏原/规则避让提示，结尾用"如需调整告诉我！"或类似话术。
+  ⚠️ 严禁出现任何菜名、价格（￥）。
+
+菜品列表、序号、合计金额由系统根据工具真实数据自动渲染，你不需要也不允许输出。
+
+示例：
+{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "closing": "已经帮您避开了海鲜，放心吃～如需调整告诉我！"}"""
+
+
+# 知识库改写 JSON 指令（内嵌 schema）
+_KB_REWRITE_JSON_PROMPT = """请将上方工具返回的知识库检索结果改写为自然、口语化的回复。
+
+输出要求（严格遵守）：
+- 只输出一个 JSON 对象，格式：{"reply": "改写后的完整回复文本"}
+- 不要输出任何其他内容（不要 markdown、不要代码块、不要解释）。
+
+"reply" 字段要求：
+1. 去格式化：去掉"为您找到 X 条相关内容""[1]""（相关度: 0.68）""【标签】"等检索标记与序号。
+2. 保留关键事实：风险等级、食用建议、过敏原、搭配方案、互斥规则等事实信息完整保留，一字不改。
+3. 只基于工具返回内容改写，不得添加检索结果之外的信息（严禁编造）。
+4. 口语化、自然，像店员向顾客解释，结尾可加"还有其他想了解的吗？"。"""
+
+
 class OrderingAgent:
     """基于 LangChain 1.0 的无状态点餐智能体（短路优化版）。
 
@@ -279,6 +320,9 @@ class OrderingAgent:
 
         self.llm = ChatOpenAI(**llm_kwargs)
         self.llm_with_tools = self.llm.bind_tools(ALL_TOOLS)
+        # 结构化输出专用实例：强制 JSON Mode（response_format=json_object）。
+        # 用于第 2 次 LLM 调用的语气词生成/知识库改写，保证输出是合法 JSON，可解析可校验。
+        self.llm_json = self.llm.bind(response_format={"type": "json_object"})
         self.tool_map = {t.name: t for t in ALL_TOOLS}
 
     def chat(self, user_input: str, history: list, membership_level: str = "") -> tuple[str, list]:
@@ -345,12 +389,138 @@ class OrderingAgent:
             if self._is_complete_response(final_result):
                 return final_result, [HumanMessage(content=user_input), AIMessage(content=final_result)]
 
-        # 第 2 次 LLM 调用：综合多个工具结果或知识库内容生成回复
-        final_msg = self.llm.invoke(messages)
-        response = self._strip_dsml(final_msg.content or "")
+        # 第 2 次 LLM 调用：结构化（JSON Mode）输出
+        # 防幻觉核心：LLM 只负责生成「语气词」文本（开场白/收尾语/口语化改写），
+        # 不直接产出菜品数据。菜品/价格/分类/合计一律由工具结果确定性渲染。
+        is_recommend = any(tc["name"] == "recommend_dishes" for tc in ai_msg.tool_calls)
+        if is_recommend:
+            # 推荐场景：去掉历史消息，避免上一轮菜品信息污染当前润色导致幻觉
+            rewrite_messages = [messages[0]] + messages[len(history) + 1:]
+            polished = self._json_rewrite(
+                rewrite_messages, _RECOMMEND_JSON_PROMPT, RecommendPolished
+            )
+            tool_output = self._find_recommend_output(tool_results)
+            if polished is not None and tool_output:
+                # 双保险：语气词中若复述了菜名 → 判定不合格，回退确定性渲染
+                real_names = set(self._extract_dish_entries(tool_output).keys())
+                if self._mentions_dish(polished.opening, real_names) or self._mentions_dish(
+                    polished.closing, real_names
+                ):
+                    logger.warning(
+                        "推荐语气词含菜名（opening=%s），回退到工具原始输出",
+                        polished.opening[:30],
+                    )
+                    response = self._clean_tool_output(tool_output)
+                else:
+                    response = self._render_recommendation(tool_output, polished)
+            else:
+                # 结构化输出失败 → 直接返回工具原始列表（确定性回退，零幻觉）
+                logger.warning("推荐结构化输出失败，回退到工具原始输出")
+                response = self._clean_tool_output(tool_output) if tool_output else ""
+        else:
+            # 知识库改写场景：结构化输出 {reply}
+            rewritten = self._json_rewrite(messages, _KB_REWRITE_JSON_PROMPT, KbRewriteReply)
+            if rewritten is not None:
+                response = rewritten.reply
+            else:
+                # 结构化改写失败 → 回退到工具原始检索结果（保事实，去格式）
+                logger.warning("知识库改写结构化输出失败，回退到工具原始输出")
+                response = tool_results[-1] if tool_results else ""
+
+        response = self._strip_dsml(response or "")
         if not response:
             raise AgentError("模型未返回任何内容")
+
         return response, [HumanMessage(content=user_input), AIMessage(content=response)]
+
+    # 菜名+价格提取正则：匹配 "  N. 菜名  ￥价格" 格式
+    _DISH_ENTRY_RE = re.compile(r"\d+\.\s+(.+?)\s+￥([\d.]+)")
+
+    @classmethod
+    def _extract_dish_entries(cls, text: str) -> dict[str, str]:
+        """从推荐文本中提取 {菜名: 价格} 映射"""
+        return {name: price for name, price in cls._DISH_ENTRY_RE.findall(text)}
+
+    @classmethod
+    def _clean_tool_output(cls, tool_output: str) -> str:
+        """清理工具原始输出，去除 [推荐上下文] 部分，使其适合直接展示给用户"""
+        idx = tool_output.find("\n[推荐上下文]")
+        if idx != -1:
+            return tool_output[:idx].rstrip()
+        return tool_output
+
+    @staticmethod
+    def _find_recommend_output(tool_results: list[str]) -> str:
+        """从工具结果中定位 recommend_dishes 的原始输出（含菜品列表与合计）"""
+        for r in tool_results:
+            if "为您推荐以下菜品" in r and "合计" in r:
+                return r
+        return ""
+
+    @classmethod
+    def _render_recommendation(cls, tool_output: str, polished: RecommendPolished) -> str:
+        """确定性渲染推荐结果：开场白 + 工具菜品列表（含合计） + 收尾语。
+
+        LLM 只提供语气词文本（opening/closing），菜品/价格/分类/合计全部来自
+        工具输出，从结构上杜绝菜名编造、遗漏、价格篡改三类幻觉。
+        """
+        body = cls._clean_tool_output(tool_output)
+        return f"{polished.opening}\n\n{body}\n\n{polished.closing}"
+
+    @staticmethod
+    def _mentions_dish(text: str, dish_names: set[str]) -> bool:
+        """检测文本是否出现任何菜名。
+
+        用于双保险校验：LLM 生成的语气词（开场白/收尾语）中严禁复述菜名。
+        """
+        if not dish_names:
+            return False
+        return any(name and name in text for name in dish_names)
+
+    @staticmethod
+    def _parse_json_object(text: str) -> dict | None:
+        """容错解析 LLM 返回的 JSON 对象（支持 markdown ```json 包裹与首尾噪音）。
+
+        Returns:
+            dict 或 None（解析失败）
+        """
+        if not text:
+            return None
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                return None
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return None
+        return data if isinstance(data, dict) else None
+
+    def _json_rewrite(self, messages: list, json_instruction: str, model: type[BaseModel]):
+        """调用 LLM 生成结构化（JSON Mode）输出并解析为 Pydantic 模型。
+
+        防幻觉设计：
+          - 强制 response_format={"type":"json_object"}（DeepSeek 官方保证输出合法 JSON）。
+          - schema 内嵌于 json_instruction，由模型严格遵循。
+          - 解析/校验失败时返回 None，调用方回退到确定性渲染（工具原始输出）。
+        """
+        try:
+            final_msg = self.llm_json.invoke(
+                messages + [SystemMessage(content=json_instruction)]
+            )
+            data = self._parse_json_object(final_msg.content or "")
+            if data is None:
+                return None
+            return model(**data)
+        except Exception as e:
+            logger.warning("LLM 结构化输出解析失败（回退确定性渲染）: %s", e)
+            return None
 
     @staticmethod
     def _is_complete_response(text: str) -> bool:

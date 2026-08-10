@@ -115,6 +115,9 @@ class CartAgent:
             llm_kwargs["base_url"] = base_url
 
         self.llm = ChatOpenAI(**llm_kwargs)
+        # 结构化输出：强制 JSON Mode（response_format=json_object），
+        # 保证菜名提取输出是合法 JSON，减少解析失败与格式污染。
+        self.llm_json = self.llm.bind(response_format={"type": "json_object"})
 
     def chat(self, user_input: str, session_id: str, session_token: str) -> tuple[str, dict]:
         """处理加购请求：LLM 提取菜名 → 反查 id → 同步加购 → 返回 (回复文本, 加购结果)。
@@ -136,7 +139,7 @@ class CartAgent:
             HumanMessage(content=user_input),
         ]
         try:
-            resp = self.llm.invoke(messages)
+            resp = self.llm_json.invoke(messages)
         except Exception as e:
             logger.exception("cart_agent LLM 调用失败")
             raise CartAgentError(f"加购助手暂时不可用：{e}") from e
