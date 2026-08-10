@@ -91,12 +91,13 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
    - 正确做法：直接调用对应工具（recommend_dishes / add_to_cart 等），不要在文本中提及工具名、参数或调用过程。工具调用后，基于返回结果回复顾客。
 
 ## 📝 推荐结果润色规范（重要）
-recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系统自动渲染**，你只需要生成两段"语气词"文本：开场白（opening）和收尾语（closing）。
+recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系统自动渲染**，你只需要生成三段"语气词"文本：开场白（opening）、推荐理由（reason）、收尾语（closing）。
 
 **⚠️ 语气词硬约束（违反将触发系统回退，丢弃你的输出）**：
-1. **禁止出现菜名/价格**：开场白和收尾语中不得出现任何菜名、价格（￥）、分类名或"合计"字样。
-2. **菜品列表不要管**：不要复述菜品、不要排序号、不要写分类标题——这些由系统基于工具真实数据渲染。
-3. **只输出 JSON**：按系统要求的格式输出 {"opening": "...", "closing": "..."}，不要输出任何其他内容。
+1. **开场白/收尾语禁止出现菜名/价格**：不得出现任何菜名、价格（￥）、分类名或"合计"字样。
+2. **推荐理由可提及菜名，但只能提推荐列表内的**：reason 里可点名推荐列表中的菜做点缀（如"招牌菌汤锅底打底，鲜到掉眉毛"），严禁出现价格（￥）、"合计"、以及推荐列表之外的任何菜名。
+3. **菜品列表不要管**：不要复述菜品、不要排序号、不要写分类标题——这些由系统基于工具真实数据渲染。
+4. **只输出 JSON**：按系统要求的格式输出 {"opening": "...", "reason": "...", "closing": "..."}，不要输出任何其他内容。
 
 **开场白参考**（融入上下文信息，1-2 句，像朋友推荐）：
 - 人数 → 说"给X位客人挑了这些好菜"
@@ -106,10 +107,14 @@ recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系�
 - 过敏原 → 提及"海鲜已经帮您避开了"
 - 规则避让 → 提及"有些不太搭的菜帮您跳过了"
 
+**推荐理由参考**（1-3 句，讲"为什么这么搭"）：
+- 菌汤打底鲜香暖胃 / 招牌与特色菌搭配有层次 / 荤素均衡不单调
+- 已避开的过敏原、规则避让、人群适配（老人小孩孕妇都合适）
+
 **收尾语**：1-2 句，包含规则避让/过敏原提示，以"如需调整告诉我！"或类似话术结尾。
 
 **示例**：
-{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "closing": "已经帮您避开了海鲜，放心吃～如需调整告诉我！"}
+{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "reason": "菌汤锅底打底，鲜香暖胃；招牌菜和特色菌搭配有层次，荤素均衡不单调，已经把海鲜和口味冲突的菜都避开了。", "closing": "放心吃～如需调整告诉我！"}
 
 ## 📚 知识库查询结果改写规范（重要）
 当调用 `search_dish_knowledge` / `get_pairing_plan` / `get_exclusion_rules` / `get_fruit_allergen_info` 后，工具返回的是**结构化检索结果**（含"为您找到 X 条相关内容"、相关度分数、【标签】等格式化标记）。你必须将其**改写为自然、口语化的回复**，并按系统要求输出结构化 JSON（{"reply": "改写后的完整回复文本"}），不要原样复述工具输出格式。
@@ -244,8 +249,13 @@ recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系�
 # 系统用工具真实结果确定性渲染，从结构上杜绝菜名编造、遗漏、价格篡改。
 
 class RecommendPolished(BaseModel):
-    """推荐润色结构化输出：只含开场白与收尾语（语气词），不含任何菜品数据。"""
+    """推荐润色结构化输出：只含语气词（开场白/推荐理由/收尾语），不含任何菜品数据。
+
+    reason 字段允许提及推荐列表中的菜名（系统做白名单校验），
+    但严禁出现价格、合计，以及推荐列表之外的任何菜名。
+    """
     opening: str = Field(..., description="开场白，1-2 句。严禁出现任何菜名/价格/分类名")
+    reason: str = Field(default="", description="推荐理由，口语化。可提及推荐列表内的菜名；严禁出现价格/合计/推荐列表外的菜名")
     closing: str = Field(..., description="收尾语，1-2 句。严禁出现任何菜名/价格")
 
 
@@ -258,19 +268,22 @@ class KbRewriteReply(BaseModel):
 _RECOMMEND_JSON_PROMPT = """请基于上方工具返回的菜品列表和 [推荐上下文]，生成一段推荐语的开场白与收尾语。
 
 输出要求（严格遵守）：
-- 只输出一个 JSON 对象，格式：{"opening": "开场白", "closing": "收尾语"}
+- 只输出一个 JSON 对象，格式：{"opening": "开场白", "reason": "推荐理由", "closing": "收尾语"}
 - 不要输出任何其他内容（不要 markdown、不要代码块、不要解释、不要菜品列表）。
 
 字段要求：
 - "opening"：1-2 句、有人情味、像朋友推荐。可引用上下文中的人数/口味/天气/季节/会员等级/过敏原/规则避让。
   ⚠️ 严禁出现任何菜名、价格（￥）、分类名或"合计"。
+- "reason"：口语化的推荐理由（1-3 句），讲清楚"为什么这么搭"——如菌汤打底鲜香暖胃、招牌与特色搭配有层次、荤素均衡、已避开的过敏原/规则避让。
+  可以提及推荐列表中的菜名做点缀（如"招牌菌汤锅底打底，鲜到掉眉毛"）。
+  ⚠️ 严禁出现价格（￥）、"合计"、以及推荐列表之外的任何菜名。
 - "closing"：1-2 句，包含过敏原/规则避让提示，结尾用"如需调整告诉我！"或类似话术。
   ⚠️ 严禁出现任何菜名、价格（￥）。
 
 菜品列表、序号、合计金额由系统根据工具真实数据自动渲染，你不需要也不允许输出。
 
 示例：
-{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "closing": "已经帮您避开了海鲜，放心吃～如需调整告诉我！"}"""
+{"opening": "天冷就该吃火锅！给2位客人挑了一桌暖心好菜，香辣够味～", "reason": "菌汤锅底打底，鲜香暖胃；招牌菜和特色菌搭配有层次，荤素均衡不单调，已经把海鲜和口味冲突的菜都避开了。", "closing": "放心吃～如需调整告诉我！"}"""
 
 
 # 知识库改写 JSON 指令（内嵌 schema）
@@ -401,14 +414,17 @@ class OrderingAgent:
             )
             tool_output = self._find_recommend_output(tool_results)
             if polished is not None and tool_output:
-                # 双保险：语气词中若复述了菜名 → 判定不合格，回退确定性渲染
+                # 双保险校验：
+                #   1) 开场白/收尾语中复述菜名 → 不合格
+                #   2) 推荐理由（reason）白名单：无价格/合计，且提及的菜名必须来自推荐列表
                 real_names = set(self._extract_dish_entries(tool_output).keys())
-                if self._mentions_dish(polished.opening, real_names) or self._mentions_dish(
-                    polished.closing, real_names
-                ):
+                reason_ok = self._validate_reason(polished.reason, real_names)
+                if (self._mentions_dish(polished.opening, real_names)
+                        or self._mentions_dish(polished.closing, real_names)
+                        or not reason_ok):
                     logger.warning(
-                        "推荐语气词含菜名（opening=%s），回退到工具原始输出",
-                        polished.opening[:30],
+                        "推荐语气词/理由校验失败（opening=%s reason_ok=%s），回退到工具原始输出",
+                        polished.opening[:30], reason_ok,
                     )
                     response = self._clean_tool_output(tool_output)
                 else:
@@ -459,13 +475,63 @@ class OrderingAgent:
 
     @classmethod
     def _render_recommendation(cls, tool_output: str, polished: RecommendPolished) -> str:
-        """确定性渲染推荐结果：开场白 + 工具菜品列表（含合计） + 收尾语。
+        """确定性渲染推荐结果：开场白 + 工具菜品列表（含合计） + 推荐理由 + 收尾语。
 
-        LLM 只提供语气词文本（opening/closing），菜品/价格/分类/合计全部来自
+        LLM 只提供语气词文本（opening/reason/closing），菜品/价格/分类/合计全部来自
         工具输出，从结构上杜绝菜名编造、遗漏、价格篡改三类幻觉。
         """
         body = cls._clean_tool_output(tool_output)
-        return f"{polished.opening}\n\n{body}\n\n{polished.closing}"
+        parts = [polished.opening, body]
+        if polished.reason:
+            # "推荐理由：" 前缀会被前端识别为独立理由区域
+            parts.append(f"推荐理由：{polished.reason}")
+        parts.append(polished.closing)
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _validate_reason(cls, reason: str, real_names: set[str]) -> bool:
+        """校验推荐理由（reason）白名单：
+          1. 为空 → 通过（可无理由）
+          2. 严禁出现价格（￥）或"合计"
+          3. 提及的菜名必须来自推荐列表（出现未推荐菜单菜名 → 判为幻觉）
+        """
+        if not reason or not reason.strip():
+            return True
+        if "￥" in reason or "合计" in reason:
+            logger.warning("推荐理由含价格/合计: %s", reason[:30])
+            return False
+        try:
+            from tools import get_merged_dishes
+            all_menu_names = {d.name for d in get_merged_dishes()}
+        except Exception:
+            # 菜单数据不可用时退化为宽松校验（仅禁价格/合计）
+            return True
+        if cls._mentions_unknown_dish(reason, real_names, all_menu_names):
+            logger.warning("推荐理由提及未推荐菜品: %s", reason[:40])
+            return False
+        return True
+
+    @staticmethod
+    def _mentions_unknown_dish(text: str, allowed_names: set[str], all_names: set[str]) -> bool:
+        """检测文本中是否出现「允许集合之外」的菜单菜名（推荐理由白名单校验）。
+
+        放行规则：与已推荐菜名存在包含关系的菜名视为简称/变体（如"香茅草烤鱼"
+        是"傣味香茅草烤鱼"的简称），不判定为幻觉。
+
+        Returns:
+            True 表示文本出现了未被推荐、且与推荐菜无关的真实菜单菜名（视为幻觉）
+        """
+        if not text:
+            return False
+        for name in all_names:
+            if name in allowed_names:
+                continue
+            # 简称/变体放行：与某个已推荐菜名存在包含关系
+            if any(name in a or a in name for a in allowed_names):
+                continue
+            if name in text:
+                return True
+        return False
 
     @staticmethod
     def _mentions_dish(text: str, dish_names: set[str]) -> bool:
