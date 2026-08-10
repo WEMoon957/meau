@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小菌点餐智能体 API 文档</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: #f7f8fa;
+    --bg-code: #1e293b;
+    --text: #1f2937;
+    --text-soft: #4b5563;
+    --text-muted: #6b7280;
+    --border: #e5e7eb;
+    --primary: #0ea5e9;
+    --primary-dark: #0284c7;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --code-text: #e2e8f0;
+    --tag-get: #10b981;
+    --tag-post: #f59e0b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg-soft);
+    color: var(--text);
+    line-height: 1.7;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--primary-dark); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* 顶部栏 */
+  .topbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 56px;
+    background: #fff; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 24px; z-index: 100;
+    box-shadow: 0 1px 2px rgba(0,0,0,.03);
+  }
+  .topbar .logo { font-weight: 700; font-size: 16px; color: var(--text); }
+  .topbar .logo span { color: var(--primary); }
+  .topbar .meta { margin-left: auto; font-size: 12px; color: var(--text-muted); }
+  .topbar .badge {
+    display: inline-block; padding: 2px 8px; background: #ecfeff;
+    color: var(--primary-dark); border-radius: 4px; font-size: 12px;
+    margin-left: 8px; border: 1px solid #cffafe;
+  }
+
+  /* 侧边栏 */
+  .sidebar {
+    position: fixed; top: 56px; left: 0; bottom: 0; width: 240px;
+    background: #fff; border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 16px 0;
+  }
+  .sidebar .group-title {
+    font-size: 11px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: .5px;
+    padding: 12px 20px 6px;
+  }
+  .sidebar a {
+    display: block; padding: 7px 20px; color: var(--text-soft);
+    font-size: 13px; border-left: 3px solid transparent;
+  }
+  .sidebar a:hover { background: var(--bg-soft); text-decoration: none; }
+  .sidebar a.active {
+    background: #ecfeff; color: var(--primary-dark);
+    border-left-color: var(--primary); font-weight: 600;
+  }
+  .sidebar .method-tag {
+    display: inline-block; width: 32px; font-size: 10px; font-weight: 700;
+    text-align: center; padding: 1px 0; border-radius: 3px; margin-right: 6px;
+  }
+  .method-tag.get { background: #d1fae5; color: #065f46; }
+  .method-tag.post { background: #fef3c7; color: #92400e; }
+
+  /* 主内容 */
+  .main {
+    margin-left: 240px; margin-top: 56px; padding: 32px 40px 80px;
+    max-width: 1100px;
+  }
+  section { margin-bottom: 48px; scroll-margin-top: 72px; }
+  h1 { font-size: 28px; margin-bottom: 8px; color: var(--text); }
+  h2 {
+    font-size: 22px; margin-bottom: 16px; padding-bottom: 8px;
+    border-bottom: 2px solid var(--border); color: var(--text);
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2 .endpoint-method {
+    display: inline-block; padding: 3px 10px; font-size: 12px;
+    font-weight: 700; border-radius: 4px; color: #fff;
+  }
+  h2 .endpoint-method.get { background: var(--tag-get); }
+  h2 .endpoint-method.post { background: var(--tag-post); }
+  h2 .endpoint-path {
+    font-family: "SFMono-Regular", Consolas, monospace; font-size: 16px;
+    color: var(--text-soft); font-weight: 600;
+  }
+  h3 { font-size: 16px; margin: 20px 0 10px; color: var(--text); }
+  p { margin-bottom: 10px; color: var(--text-soft); }
+  ul, ol { margin: 8px 0 12px 22px; color: var(--text-soft); }
+  li { margin-bottom: 4px; }
+
+  /* 提示框 */
+  .note {
+    background: #eff6ff; border-left: 4px solid var(--primary);
+    padding: 12px 16px; margin: 12px 0; border-radius: 4px;
+    font-size: 13px; color: #1e40af;
+  }
+  .note.warn { background: #fffbeb; border-left-color: var(--warning); color: #92400e; }
+  .note.danger { background: #fef2f2; border-left-color: var(--danger); color: #991b1b; }
+  .note strong { font-weight: 700; }
+
+  /* 表格 */
+  table {
+    width: 100%; border-collapse: collapse; margin: 12px 0;
+    background: #fff; border: 1px solid var(--border); border-radius: 6px;
+    overflow: hidden; font-size: 13px;
+  }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: var(--bg-soft); font-weight: 600; color: var(--text); font-size: 12px; }
+  td { color: var(--text-soft); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #fafbfc; }
+  td code, p code, li code {
+    font-family: "SFMono-Regular", Consolas, monospace;
+    background: #f1f5f9; padding: 1px 6px; border-radius: 3px;
+    font-size: 12px; color: #be185d;
+  }
+  td.required-yes { color: var(--danger); font-weight: 600; }
+  td.required-no { color: var(--text-muted); }
+
+  /* 代码块 */
+  pre {
+    background: var(--bg-code); color: var(--code-text);
+    padding: 16px 18px; border-radius: 6px; overflow-x: auto;
+    margin: 12px 0; font-size: 13px; line-height: 1.6;
+    font-family: "SFMono-Regular", Consolas, "Courier New", monospace;
+  }
+  pre .k { color: #f472b6; }    /* keyword */
+  pre .s { color: #86efac; }    /* string */
+  pre .n { color: #fde047; }    /* number */
+  pre .c { color: #94a3b8; font-style: italic; } /* comment */
+  pre .key { color: #7dd3fc; }  /* json key */
+
+  /* 标签 */
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 11px; font-weight: 600; margin: 0 2px;
+  }
+  .tag.green { background: #d1fae5; color: #065f46; }
+  .tag.yellow { background: #fef3c7; color: #92400e; }
+  .tag.red { background: #fee2e2; color: #991b1b; }
+  .tag.blue { background: #dbeafe; color: #1e40af; }
+  .tag.gray { background: #f3f4f6; color: #4b5563; }
+
+  /* 锚点链接 */
+  .anchor { color: var(--text-muted); margin-left: 6px; opacity: 0; font-size: 14px; }
+  h2:hover .anchor, h3:hover .anchor { opacity: 1; }
+
+  /* 响应式 */
+  @media (max-width: 900px) {
+    .sidebar { display: none; }
+    .main { margin-left: 0; padding: 24px 18px 60px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo">小菌<span>点餐智能体</span> API 文档</div>
+  <span class="badge">v1.0</span>
+  <div class="meta">FastAPI · 默认端口 3000</div>
+</div>
+
+<aside class="sidebar" id="sidebar">
+  <div class="group-title">通用</div>
+  <a href="#overview" class="active"><span class="method-tag get">DOC</span>服务概览</a>
+  <a href="#conventions"><span class="method-tag get">DOC</span>通用约定</a>
+  <a href="#auth"><span class="method-tag get">DOC</span>鉴权机制</a>
+  <a href="#rate-limit"><span class="method-tag get">DOC</span>限流策略</a>
+  <a href="#errors"><span class="method-tag get">DOC</span>错误码</a>
+
+  <div class="group-title">对话接口</div>
+  <a href="#chat"><span class="method-tag post">POST</span>AI 对话</a>
+  <a href="#reset"><span class="method-tag post">POST</span>重置对话</a>
+  <a href="#info"><span class="method-tag get">GET</span>服务信息</a>
+  <a href="#health"><span class="method-tag get">GET</span>健康检查</a>
+
+  <div class="group-title">购物车</div>
+  <a href="#dish-resolve"><span class="method-tag post">POST</span>菜名反查ID</a>
+  <a href="#cart-add"><span class="method-tag post">POST</span>单品加购</a>
+  <a href="#cart-batch"><span class="method-tag post">POST</span>批量加购</a>
+  <a href="#cart-agent"><span class="method-tag post">POST</span>自然语言加购</a>
+
+  <div class="group-title">其他</div>
+  <a href="#static"><span class="method-tag get">GET</span>静态页面</a>
+  <a href="#env"><span class="method-tag get">DOC</span>环境变量</a>
+  <a href="#constraints"><span class="method-tag get">DOC</span>业务约束</a>
+</aside>
+
+<main class="main">
+
+  <!-- 概览 -->
+  <section id="overview">
+    <h1>小菌点餐智能体 API 文档</h1>
+    <p>服务名：<strong>小味点餐智能体</strong> · 框架：<strong>FastAPI</strong> · 默认监听 <code>0.0.0.0:3000</code>（生产由 gunicorn + nginx 前置）</p>
+    <ul>
+      <li>本地开发：<code>http://localhost:3000</code></li>
+      <li>生产：由 nginx 反代，建议 <code>https://your-domain.com</code></li>
+    </ul>
+    <div class="note">
+      <strong>接口源码：</strong>
+      <a href="file:///d:/meau/main/api_server.py">main/api_server.py</a> ·
+      <a href="file:///d:/meau/main/cart_api.py">main/cart_api.py</a>
+    </div>
+  </section>
+
+  <!-- 通用约定 -->
+  <section id="conventions">
+    <h2>通用约定 <a href="#conventions" class="anchor">#</a></h2>
+
+    <h3>统一响应结构</h3>
+    <p>所有业务接口均返回如下 JSON 结构（部分接口有扩展字段）：</p>
+<pre>{
+  <span class="key">"code"</span>: 200,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"..."</span>: <span class="s">"业务字段"</span>
+}</pre>
+
+    <h3>内容类型</h3>
+    <p>请求体与响应体均为 <code>application/json; charset=utf-8</code>。</p>
+  </section>
+
+  <!-- 鉴权 -->
+  <section id="auth">
+    <h2>鉴权机制（会话令牌） <a href="#auth" class="anchor">#</a></h2>
+    <p>系统采用 <code>session_id</code> + <code>session_token</code> 双凭证防御 IDOR（越权访问）：</p>
+    <table>
+      <thead>
+        <tr><th>场景</th><th>session_id</th><th>session_token</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>新建会话</td>
+          <td>传空字符串 <code>""</code></td>
+          <td>传空字符串 <code>""</code>，服务端签发新 token 并在响应中返回</td>
+        </tr>
+        <tr>
+          <td>已有会话</td>
+          <td>必传</td>
+          <td>必传，且必须与服务端记录匹配</td>
+        </tr>
+        <tr>
+          <td>购物车 / 重置操作</td>
+          <td>必传</td>
+          <td>必传（必须为已存在的会话）</td>
+        </tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>token 校验失败返回 <span class="tag red">401</span>，需重新发起会话</li>
+      <li>购物车类接口强制 <code>require_existing=True</code>，不允许匿名 / 新会话直接操作</li>
+    </ul>
+  </section>
+
+  <!-- 限流 -->
+  <section id="rate-limit">
+    <h2>限流策略 <a href="#rate-limit" class="anchor">#</a></h2>
+    <p>固定窗口计数限流（多 worker 部署时计数共享 Redis，单 worker 回退进程内）：</p>
+    <table>
+      <thead>
+        <tr><th>接口类别</th><th>维度</th><th>阈值</th><th>窗口</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>对话 <code>/api/ai/chat</code></td><td>每会话</td><td>30 次</td><td>60s</td></tr>
+        <tr><td>对话 <code>/api/ai/chat</code></td><td>每 IP</td><td>60 次</td><td>60s</td></tr>
+        <tr><td>购物车 <code>/api/cart/*</code>、<code>/api/dish/resolve</code></td><td>每会话</td><td>10 次</td><td>60s</td></tr>
+        <tr><td>购物车 <code>/api/cart/*</code>、<code>/api/dish/resolve</code></td><td>每 IP</td><td>20 次</td><td>60s</td></tr>
+        <tr><td>会话操作 <code>/api/ai/reset</code></td><td>每会话</td><td>10 次</td><td>60s</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>超限返回 <span class="tag yellow">429</span>，带 <code>Retry-After</code> 头</li>
+      <li>限流器未就绪或 Redis 故障返回 <span class="tag red">503</span></li>
+    </ul>
+
+    <h3>并发与背压</h3>
+    <ul>
+      <li>单 worker 最大并发 LLM 调用：<code>MAX_CONCURRENT_CHATS</code>（默认 20）</li>
+      <li>达到上限立即返回 <span class="tag red">503</span>（不排队），带 <code>Retry-After: 5</code></li>
+    </ul>
+  </section>
+
+  <!-- 错误码 -->
+  <section id="errors">
+    <h2>错误码 <a href="#errors" class="anchor">#</a></h2>
+    <table>
+      <thead>
+        <tr><th>code / HTTP</th><th>含义</th><th>触发场景</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><span class="tag green">200</span></td><td>成功</td><td>正常响应</td></tr>
+        <tr><td><span class="tag red">400</span></td><td>参数错误</td><td>session_id 缺失 / 格式非法</td></tr>
+        <tr><td><span class="tag red">401</span></td><td>鉴权失败</td><td>session_token 缺失或不匹配</td></tr>
+        <tr><td><span class="tag yellow">429</span></td><td>限流 / 会话繁忙</td><td>超阈值或上一条消息仍在处理</td></tr>
+        <tr><td><span class="tag red">500</span></td><td>服务内部错误</td><td>未分类异常</td></tr>
+        <tr><td><span class="tag red">502</span></td><td>上游模型异常</td><td>AgentError / CartAgentError</td></tr>
+        <tr><td><span class="tag red">503</span></td><td>服务不可用</td><td>限流器 / Redis 故障、并发满载、LLM 上游异常</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 对话接口 -->
+  <section id="chat">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/ai/chat</span>
+      <a href="#chat" class="anchor">#</a>
+    </h2>
+    <p>发送用户消息，返回 AI 回复（推荐 / 问答 / 知识库查询统一入口）。</p>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>约束</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>user_message</code></td><td>string</td><td class="required-yes">是</td><td>1–2000 字符</td><td>用户输入</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-no">否</td><td>≤64 字符</td><td>空 = 新建会话</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-no">否</td><td>≤128 字符</td><td>空 = 新建会话</td></tr>
+        <tr><td><code>membership_level</code></td><td>string</td><td class="required-no">否</td><td>≤32 字符，默认"普通会员"</td><td>会员等级</td></tr>
+      </tbody>
+    </table>
+
+    <h3>响应</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>code</code></td><td>int</td><td>200</td></tr>
+        <tr><td><code>msg</code></td><td>string</td><td>"success"</td></tr>
+        <tr><td><code>aimessage</code></td><td>string</td><td>AI 回复文本（已剥离 DSML / 控制字符）</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td>会话 ID（新会话为新生成的 UUID）</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td>新会话非空（需前端保存），已有会话为空字符串</td></tr>
+      </tbody>
+    </table>
+
+    <h3>示例</h3>
+<pre><span class="c">// 请求（新建会话）</span>
+{
+  <span class="key">"user_message"</span>: <span class="s">"6个人吃，要特辣"</span>,
+  <span class="key">"session_id"</span>: <span class="s">""</span>,
+  <span class="key">"session_token"</span>: <span class="s">""</span>
+}
+
+<span class="c">// 响应</span>
+{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"aimessage"</span>: <span class="s">"为您推荐：\n1. 菌汤生态鸡子母锅(￥128)...\n合计：￥xxx"</span>,
+  <span class="key">"session_id"</span>: <span class="s">"a1b2c3d4-..."</span>,
+  <span class="key">"session_token"</span>: <span class="s">"eyJhbGciOi..."</span>
+}</pre>
+  </section>
+
+  <!-- 重置对话 -->
+  <section id="reset">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/ai/reset</span>
+      <a href="#reset" class="anchor">#</a>
+    </h2>
+    <p>清空指定会话的历史上下文（需 token 校验，防越权重置他人会话）。</p>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-yes">是</td><td>1–64 字符</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-yes">是</td><td>1–128 字符</td></tr>
+      </tbody>
+    </table>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"session_id"</span>: <span class="s">"a1b2c3d4-..."</span>
+}</pre>
+  </section>
+
+  <!-- 服务信息 -->
+  <section id="info">
+    <h2>
+      <span class="endpoint-method get">GET</span>
+      <span class="endpoint-path">/api/ai/info</span>
+      <a href="#info" class="anchor">#</a>
+    </h2>
+    <p>获取服务能力与配置（无需鉴权）。</p>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"data"</span>: {
+    <span class="key">"name"</span>: <span class="s">"小味点餐智能体"</span>,
+    <span class="key">"model"</span>: <span class="s">"qwen3.7-max"</span>,
+    <span class="key">"tools"</span>: [<span class="s">"recommend_dishes"</span>, <span class="s">"kb_query"</span>, <span class="s">"add_to_cart"</span>, <span class="s">"..."</span>],
+    <span class="key">"capabilities"</span>: [<span class="s">"菜品问答"</span>, <span class="s">"智能推荐"</span>, <span class="s">"菜品知识库查询"</span>, <span class="s">"搭配方案推荐"</span>, <span class="s">"互斥规则提示"</span>, <span class="s">"水果过敏原查询"</span>],
+    <span class="key">"limits"</span>: {
+      <span class="key">"session_ttl_seconds"</span>: <span class="n">1800</span>,
+      <span class="key">"max_sessions"</span>: <span class="n">1000</span>,
+      <span class="key">"max_concurrent_chats"</span>: <span class="n">20</span>,
+      <span class="key">"chat_rate_per_session"</span>: <span class="n">30</span>,
+      <span class="key">"chat_rate_per_ip"</span>: <span class="n">60</span>,
+      <span class="key">"chat_rate_window_seconds"</span>: <span class="n">60</span>
+    }
+  }
+}</pre>
+  </section>
+
+  <!-- 健康检查 -->
+  <section id="health">
+    <h2>
+      <span class="endpoint-method get">GET</span>
+      <span class="endpoint-path">/api/health</span>
+      <a href="#health" class="anchor">#</a>
+    </h2>
+    <p>探活 DB / Redis / KB，供负载均衡摘流（任一关键依赖不可用返回 <span class="tag red">503</span>）。</p>
+
+    <h3>响应（200 或 503）</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"ok"</span>,
+  <span class="key">"data"</span>: {
+    <span class="key">"dish_count"</span>: <span class="n">120</span>,
+    <span class="key">"active_sessions"</span>: <span class="n">5</span>,
+    <span class="key">"max_sessions"</span>: <span class="n">1000</span>,
+    <span class="key">"session_ttl_seconds"</span>: <span class="n">1800</span>,
+    <span class="key">"max_concurrent_chats"</span>: <span class="n">20</span>,
+    <span class="key">"concurrent_at_capacity"</span>: <span class="k">false</span>,
+    <span class="key">"rate_limits"</span>: { <span class="key">"per_session"</span>: <span class="s">"30/60s"</span>, <span class="key">"per_ip"</span>: <span class="s">"60/60s"</span> },
+    <span class="key">"dependencies"</span>: { <span class="key">"db"</span>: <span class="s">"ok"</span>, <span class="key">"redis"</span>: <span class="s">"ok"</span>, <span class="key">"kb"</span>: <span class="s">"ok"</span> }
+  }
+}</pre>
+    <div class="note">
+      <strong>字段说明：</strong>
+      <code>redis</code>：<code>ok</code> / <code>fail</code> / <code>disabled</code>（未启用）；
+      <code>kb</code>：<code>ok</code> / <code>unloaded</code>
+    </div>
+  </section>
+
+  <!-- 菜名反查 -->
+  <section id="dish-resolve">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/dish/resolve</span>
+      <a href="#dish-resolve" class="anchor">#</a>
+    </h2>
+    <p>从推荐文本解析出的菜名反查菜品 id，供后续批量加购。复用内存索引，O(1) 精确 / 模糊匹配。<strong>确认下单流程第一步。</strong></p>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>dish_names</code></td><td>string[]</td><td class="required-yes">是</td><td>1–30 个菜名</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-yes">是</td><td>已存在会话</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-yes">是</td><td>会话令牌</td></tr>
+      </tbody>
+    </table>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"dishes"</span>: [
+    { <span class="key">"id"</span>: <span class="n">12</span>, <span class="key">"name"</span>: <span class="s">"菌汤生态鸡子母锅"</span>, <span class="key">"price"</span>: <span class="n">128.0</span>, <span class="key">"category"</span>: <span class="s">"菌汤锅底"</span>, <span class="key">"spicy_level"</span>: <span class="s">"微辣"</span> }
+  ],
+  <span class="key">"missing"</span>: [<span class="s">"不存在的菜"</span>]
+}</pre>
+  </section>
+
+  <!-- 单品加购 -->
+  <section id="cart-add">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/cart/add</span>
+      <a href="#cart-add" class="anchor">#</a>
+    </h2>
+    <p>代理调用收钱吧 openApi（RSA2 签名在后端完成，私钥不出后端）。</p>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>默认</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>groupId</code></td><td>int</td><td class="required-yes">是</td><td>-</td><td>集团 ID</td></tr>
+        <tr><td><code>orgId</code></td><td>int</td><td class="required-yes">是</td><td>-</td><td>组织 ID</td></tr>
+        <tr><td><code>goodsId</code></td><td>int</td><td class="required-yes">是</td><td>-</td><td>商品 id（全来店 goodsId）</td></tr>
+        <tr><td><code>skuId</code></td><td>int</td><td class="required-yes">是</td><td>-</td><td>SKU id（方案 A 与 goodsId 相同）</td></tr>
+        <tr><td><code>goodsName</code></td><td>string</td><td class="required-no">否</td><td>""</td><td>≤100 字符</td></tr>
+        <tr><td><code>goodsNum</code></td><td>float</td><td class="required-no">否</td><td>1</td><td>&gt;0</td></tr>
+        <tr><td><code>businessType</code></td><td>int</td><td class="required-no">否</td><td>3</td><td>1自提 2外卖 3堂食 4外带</td></tr>
+        <tr><td><code>openId</code></td><td>string</td><td class="required-yes">是</td><td>-</td><td>用户 openId，1–128 字符</td></tr>
+        <tr><td><code>shopId</code></td><td>string</td><td class="required-no">否</td><td>""</td><td>透传日志用</td></tr>
+        <tr><td><code>brandId</code></td><td>int</td><td class="required-no">否</td><td>0</td><td>-</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-yes">是</td><td>-</td><td>会话鉴权</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-yes">是</td><td>-</td><td>会话鉴权</td></tr>
+      </tbody>
+    </table>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"data"</span>: { <span class="key">"..."</span>: <span class="s">"收钱吧返回"</span> }
+}</pre>
+  </section>
+
+  <!-- 批量加购 -->
+  <section id="cart-batch">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/cart/batch-add</span>
+      <a href="#cart-batch" class="anchor">#</a>
+    </h2>
+    <p>前端把反查到的菜品 id 组装成 items 一次性提交。<strong>确认下单流程第二步。</strong></p>
+    <div class="note warn">
+      <strong>降级策略：</strong>后端逐个调用收钱吧网关，<strong>全部失败时降级为 mock 成功</strong>（<code>mocked=true</code>），保证推荐→确认→加购链路可演示。
+    </div>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>默认</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>items</code></td><td>BatchCartItem[]</td><td class="required-yes">是</td><td>-</td><td>1–30 个菜品</td></tr>
+        <tr><td><code>groupId</code></td><td>int</td><td class="required-no">否</td><td>0</td><td>网关未通可不传</td></tr>
+        <tr><td><code>orgId</code></td><td>int</td><td class="required-no">否</td><td>0</td><td>-</td></tr>
+        <tr><td><code>openId</code></td><td>string</td><td class="required-no">否</td><td>""</td><td>网关接通后需补全</td></tr>
+        <tr><td><code>shopId</code></td><td>string</td><td class="required-no">否</td><td>""</td><td>-</td></tr>
+        <tr><td><code>brandId</code></td><td>int</td><td class="required-no">否</td><td>0</td><td>-</td></tr>
+        <tr><td><code>businessType</code></td><td>int</td><td class="required-no">否</td><td>3</td><td>1–4</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-yes">是</td><td>-</td><td>会话鉴权</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-yes">是</td><td>-</td><td>会话鉴权</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>BatchCartItem</strong>：<code>goodsId</code>(int,必填) · <code>skuId</code>(int,必填) · <code>goodsName</code>(string) · <code>goodsNum</code>(float,默认1,&gt;0)</p>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"success_count"</span>: <span class="n">3</span>,
+  <span class="key">"failed_count"</span>: <span class="n">0</span>,
+  <span class="key">"results"</span>: [
+    { <span class="key">"goodsId"</span>: <span class="n">12</span>, <span class="key">"goodsName"</span>: <span class="s">"菌汤生态鸡子母锅"</span>, <span class="key">"ok"</span>: <span class="k">true</span>, <span class="key">"msg"</span>: <span class="s">"success"</span> }
+  ],
+  <span class="key">"mocked"</span>: <span class="k">false</span>,
+  <span class="key">"data"</span>: <span class="k">null</span>
+}</pre>
+    <div class="note">
+      <strong>mocked 字段：</strong><code>true</code> 表示收钱吧网关未通 / 未配置，已降级为演示模式成功
+    </div>
+  </section>
+
+  <!-- 自然语言加购 -->
+  <section id="cart-agent">
+    <h2>
+      <span class="endpoint-method post">POST</span>
+      <span class="endpoint-path">/api/cart/agent-chat</span>
+      <a href="#cart-agent" class="anchor">#</a>
+    </h2>
+    <p>用户用自然语言说要加什么菜（如 <code>"来份菌汤生态鸡子母锅和两份单点绣球菌加购"</code>），由 CartAgent 用 LLM 提取菜名 → 反查 id → 同步批量加购 → 自然语言回复。与对话接口平行，前端按意图路由。</p>
+
+    <h3>请求体</h3>
+    <table>
+      <thead>
+        <tr><th>字段</th><th>类型</th><th>必填</th><th>约束</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>user_message</code></td><td>string</td><td class="required-yes">是</td><td>1–500 字符</td><td>自然语言加购指令</td></tr>
+        <tr><td><code>session_id</code></td><td>string</td><td class="required-yes">是</td><td>1–64 字符</td><td>已存在会话</td></tr>
+        <tr><td><code>session_token</code></td><td>string</td><td class="required-yes">是</td><td>1–128 字符</td><td>会话令牌</td></tr>
+      </tbody>
+    </table>
+
+    <h3>响应</h3>
+<pre>{
+  <span class="key">"code"</span>: <span class="n">200</span>,
+  <span class="key">"msg"</span>: <span class="s">"success"</span>,
+  <span class="key">"aimessage"</span>: <span class="s">"已为您加入购物车：\n菌汤生态鸡子母锅\n共 1 道已加入购物车~"</span>,
+  <span class="key">"cart_result"</span>: {
+    <span class="key">"success_count"</span>: <span class="n">1</span>,
+    <span class="key">"failed_count"</span>: <span class="n">0</span>,
+    <span class="key">"mocked"</span>: <span class="k">true</span>,
+    <span class="key">"results"</span>: [
+      { <span class="key">"goodsId"</span>: <span class="n">12</span>, <span class="key">"goodsName"</span>: <span class="s">"菌汤生态鸡子母锅"</span>, <span class="key">"ok"</span>: <span class="k">true</span>, <span class="key">"msg"</span>: <span class="s">"mocked"</span> }
+    ]
+  },
+  <span class="key">"session_id"</span>: <span class="s">"a1b2c3d4-..."</span>
+}</pre>
+    <div class="note warn">
+      <strong>cart_result 说明：</strong>空 <code>null</code> 时表示未识别到要加购的菜品；含 <code>missing</code> 字段时表示部分菜名未在菜单找到
+    </div>
+  </section>
+
+  <!-- 静态页面 -->
+  <section id="static">
+    <h2>
+      <span class="endpoint-method get">GET</span>
+      <span class="endpoint-path">/ 、 /index.html</span>
+      <a href="#static" class="anchor">#</a>
+    </h2>
+    <p>返回前端入口页面 <code>index.html</code>。文件不存在时返回 <span class="tag red">404</span>。</p>
+  </section>
+
+  <!-- 环境变量 -->
+  <section id="env">
+    <h2>附录 A：关键环境变量 <a href="#env" class="anchor">#</a></h2>
+    <table>
+      <thead>
+        <tr><th>变量</th><th>默认</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>HOST</code> / <code>PORT</code></td><td>0.0.0.0 / 3000</td><td>监听地址</td></tr>
+        <tr><td><code>OPENAI_API_KEY</code> / <code>OPENAI_BASE_URL</code> / <code>OPENAI_MODEL</code></td><td>- / - / qwen3.7-max</td><td>对话 LLM（DeepSeek / 千问）</td></tr>
+        <tr><td><code>EMBEDDING_API_KEY</code> / <code>EMBEDDING_BASE_URL</code></td><td>-</td><td>向量模型（千问 text-embedding-v3）</td></tr>
+        <tr><td><code>REDIS_URL</code></td><td>空</td><td>多 worker 共享会话 / 限流；空 = 单 worker 内存</td></tr>
+        <tr><td><code>MAX_CONCURRENT_CHATS</code></td><td>20</td><td>单 worker 并发 LLM 上限</td></tr>
+        <tr><td><code>SESSION_TTL_SECONDS</code></td><td>1800</td><td>会话过期</td></tr>
+        <tr><td><code>MAX_SESSIONS</code></td><td>1000</td><td>最大并发会话</td></tr>
+        <tr><td><code>CORS_ALLOWED_ORIGINS</code></td><td>本地开发域名</td><td>跨域白名单（逗号分隔）</td></tr>
+        <tr><td><code>TRUSTED_PROXIES</code></td><td>空</td><td>可信代理 CIDR，控制 XFF 解析</td></tr>
+        <tr><td><code>SQB_APP_ID</code> / <code>SQB_PRIVATE_KEY</code> / <code>SQB_GATEWAY_URL</code> / <code>SQB_VERSION</code></td><td>-</td><td>收钱吧网关配置</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 业务约束 -->
+  <section id="constraints">
+    <h2>附录 B：业务约束 <a href="#constraints" class="anchor">#</a></h2>
+    <p>节选自项目硬约束：</p>
+    <ul>
+      <li>每次输入仅返回<strong>一个</strong>推荐方案</li>
+      <li>火锅场景必含一个<strong>锅底</strong>且计入总数</li>
+      <li>推荐输出含：菜名 + 价格 (+ 辣度 / 招牌) → 合计 → 推荐理由</li>
+      <li>所有 DB 查询走参数化 + <code>LIMIT</code> + <code>MAX_EXECUTION_TIME(5000)</code> 优化器提示</li>
+      <li>LLM 调用受 <code>LLM_REQUEST_TIMEOUT</code>（默认 30s）约束</li>
+      <li>多 worker 部署必须配置 <code>REDIS_URL</code>，否则拒绝启动</li>
+    </ul>
+  </section>
+
+</main>
+
+<script>
+  // 侧边栏滚动高亮
+  const links = document.querySelectorAll('.sidebar a');
+  const sections = document.querySelectorAll('section[id]');
+  function onScroll() {
+    let current = '';
+    const scrollY = window.scrollY;
+    sections.forEach(sec => {
+      if (scrollY + 100 >= sec.offsetTop) current = sec.id;
+    });
+    links.forEach(a => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  }
+  window.addEventListener('scroll', onScroll);
+  onScroll();
+</script>
+
+</body>
+</html>
