@@ -60,6 +60,27 @@ _DSML_TAG_RE = re.compile(r"<｜[^>]*｜>|</?｜｜DSML｜｜[^>]*>")
 # 4) 思考/DSML 标签的残留孤立标签（未闭合的 think 开/闭标签）
 _THINK_TAG_RE = re.compile(r"</?think\s*>", re.IGNORECASE)
 
+# ======================== 推荐意图识别（规则兜底） ========================
+# 背景：deepseek-v4-flash 等模型在"调整型"输入（换个口味/重新推荐/追加）下
+# 可能不调用 recommend_dishes，直接复述历史推荐甚至编造菜品（如"普洱黄牛肉"）。
+# 用正则做规则兜底：命中推荐/调整意图且 LLM 未调用工具时，强制走 recommend_dishes。
+_RECOMMEND_INTENT_RE = re.compile(
+    r"推荐|点菜|点餐|来点|来一桌|来几|来份|安排|搭配|聚餐|火锅|"
+    r"换个|换一|换点|换口|换几|不要.{0,4}(辣|甜|油)|要.{0,3}辣|太辣|"
+    r"不够吃|再来|追加|加几|加菜|几个|多点|人多|"
+    r"孕妇|儿童|小孩|老人|情侣|一人食|"
+    r"[0-9一二三四五六七八九十百]+\s*[个位]?人"
+)
+# 加购/下单意图优先，避免抢 add_to_cart 工具
+_ADD_TO_CART_INTENT_RE = re.compile(r"加购|购物车|下单|确认点单|就这些|买单|结账")
+# 纯闲聊（打招呼/道谢/道别/身份询问等），不触发推荐兜底
+_CHAT_INTENT_RE = re.compile(
+    r"^(你好|您好|谢谢|感谢|再见|拜拜|在吗|你是谁|能做什么|营业时间|地址|电话|好的|嗯|ok)\s*[!？。，~～]*$",
+    re.IGNORECASE,
+)
+# 推荐输出格式特征（LLM 未调用工具却出现这些 → 复述历史/编造）
+_RECOMMEND_OUTPUT_RE = re.compile(r"为您推荐|合计[:：]?\s*￥|---\s*\S+\s*---")
+
 
 class AgentError(Exception):
     """Agent 处理过程中的可预期错误（如模型返回空内容）。
@@ -89,6 +110,11 @@ SYSTEM_PROMPT = """你是「小菌」，一位专业的餐厅点餐智能助手�
    - 错误示例 2：回复"好的，已为您加购一份XX"但未调用 add_to_cart 工具——严禁口头声称已完成加购。
    - 错误示例 3：回复"好的，为您确认下单啦！"但未调用 add_to_cart 工具——"确认下单"必须触发 add_to_cart，不能口头回复。
    - 正确做法：直接调用对应工具（recommend_dishes / add_to_cart 等），不要在文本中提及工具名、参数或调用过程。工具调用后，基于返回结果回复顾客。
+8. **🚫 多轮对话禁止复述历史推荐（极重要）**：当用户提出新的用餐需求（换口味、追加、换菜、改人数）时，**必须重新调用 recommend_dishes 获取最新推荐**，禁止直接复述、引用或微调上一轮的推荐结果。
+   - 错误示例 1：用户说"换个中辣口味的"，你直接照抄上一轮的菜品列表——这是复述历史，必须重新调用工具。
+   - 错误示例 2：用户说"再来点高蛋白的"，你在上一轮推荐基础上口头添加一道菜（如"再加个牛肝菌"）——必须调用工具获取新的推荐组合。
+   - **未调用工具时，禁止在回复中出现任何菜品列表、价格（￥）、合计金额或分类标题。**
+   - 正确做法：识别出新的用餐需求后立即调用 recommend_dishes，把调整后的口味/人数/过敏原参数传入，历史已推荐的菜通过 exclude_dishes 排除。
 
 ## 📝 推荐结果润色规范（重要）
 recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系统自动渲染**，你只需要生成三段"语气词"文本：开场白（opening）、推荐理由（reason）、收尾语（closing）。
@@ -182,6 +208,16 @@ recommend_dishes 返回菜品列表 + [推荐上下文]。**菜品列表由系�
 - 指定人数/口味："2人吃辣""3个人清淡的""一人食"
 - 只要用户提到想吃什么、要点什么、安排什么，但**没有**加购/下单关键词，就是推荐意图
 **关键**：即使输入含错别字、语气词（哈/呗/吧/咯）、或表述模糊，只要包含用餐/点菜意向，就必须调用 recommend_dishes。不要口头回应"我来给您搭配"而不真正调用工具。
+
+**⚠️ 调整型推荐意图（多轮对话必须牢记）**：以下表达都属于**重新推荐**意图，必须重新调用 recommend_dishes 工具（不是复述历史）：
+- 换口味："换个中辣/不辣/清淡/重口味的""要是不辣的菜，重新推荐一下""不要这么辣""太辣了换一批"
+- 换菜："换一批菜""换一桌""换几道""这些都不喜欢，换点别的""有没有别的选择"
+- 追加："不够吃，再来几个菜""再加两道""多点几个""人多又来了几个"
+- 改人数："又来了2个人""再加3个人""8个人了"
+**关键**：
+- 调整型意图下，必须把**调整后的参数**（新口味 taste、新人数 people_count、过敏原 allergen_avoid）传给 recommend_dishes
+- 历史已推荐过的菜通过 **exclude_dishes** 参数排除（逗号分隔），避免重复推荐
+- **绝对禁止**直接复述、引用或微调上一轮的推荐结果而不调用工具
 
 **第 3 优先级：精确菜品查询**
 顾客明确问某道具体菜品的价格/基本信息（"XX多少钱""XX辣不辣"），调用 `query_dish`（返回精确价格+基本信息）。
@@ -366,6 +402,14 @@ class OrderingAgent:
             response = self._strip_dsml(ai_msg.content or "")
             if not response:
                 raise AgentError("模型未返回任何内容")
+            # 规则兜底：命中推荐/调整意图，但 LLM 未调用工具且输出了推荐格式
+            # （复述历史推荐/编造菜品）→ 强制走 recommend_dishes，杜绝幻觉
+            if self._is_recommend_intent(user_input) and self._looks_like_recommend_output(response):
+                logger.warning(
+                    "推荐意图但 LLM 未调用工具（输出推荐格式），规则兜底强制推荐: %s",
+                    user_input[:40],
+                )
+                return self._fallback_recommend(user_input, history, membership_level)
             return response, [HumanMessage(content=user_input), AIMessage(content=response)]
 
         # 执行工具调用
@@ -451,6 +495,107 @@ class OrderingAgent:
 
     # 菜名+价格提取正则：匹配 "  N. 菜名  ￥价格" 格式
     _DISH_ENTRY_RE = re.compile(r"\d+\.\s+(.+?)\s+￥([\d.]+)")
+
+    # ======================== 推荐意图规则兜底 ========================
+    @classmethod
+    def _looks_like_recommend_output(cls, text: str) -> bool:
+        """检测文本是否具备推荐输出格式特征（"为您推荐"/"合计￥"/分类标题）。
+
+        用于识别 LLM 未调用工具却直接复述历史推荐/编造菜品的情况。
+        """
+        return bool(_RECOMMEND_OUTPUT_RE.search(text or ""))
+
+    @staticmethod
+    def _is_recommend_intent(text: str) -> bool:
+        """判断用户输入是否为推荐/调整推荐意图（规则兜底，弥补 LLM 识别不稳定）。
+
+        排除规则：
+          - 加购/下单意图（命中 _ADD_TO_CART_INTENT_RE）→ 不触发，避免抢 add_to_cart
+          - 纯闲聊（命中 _CHAT_INTENT_RE）→ 不触发
+        """
+        if not text:
+            return False
+        if _ADD_TO_CART_INTENT_RE.search(text):
+            return False
+        if _CHAT_INTENT_RE.match(text.strip()):
+            return False
+        return bool(_RECOMMEND_INTENT_RE.search(text))
+
+    def _fallback_recommend(
+        self, user_input: str, history: list, membership_level: str = ""
+    ) -> tuple[str, list]:
+        """规则兜底：LLM 未调用推荐工具时，强制调用 recommend_dishes 并确定性渲染。
+
+        参数从用户输入 + 历史中轻量提取（不引入额外 LLM 调用）：
+          - people_count:   输入中的人数（"6个人" → 6）
+          - taste:          口味词（特辣/中辣/微辣/酸辣/香辣/不辣/清淡）
+          - customer_type:  人群词（孕妇/儿童/老人/情侣/一人食）
+          - exclude_dishes: 历史 AIMessage 中已推荐的菜名（换菜/追加场景排除）
+          - membership_level: 透传系统注入的会员等级
+        输出经 _clean_tool_output 清理后直接返回，杜绝复述历史/编造菜品。
+        """
+        text = user_input or ""
+
+        # 人数
+        m = re.search(r"(\d+)\s*个?人", text)
+        people_count = int(m.group(1)) if m else 0
+
+        # 口味
+        taste = ""
+        for t in ("特辣", "中辣", "微辣", "酸辣", "香辣"):
+            if t in text:
+                taste = t
+                break
+        if not taste and ("不辣" in text or "清淡" in text):
+            taste = "不辣"
+
+        # 人群
+        customer_type = ""
+        for c in ("孕妇", "儿童", "小孩", "老人", "情侣", "一人食"):
+            if c in text:
+                customer_type = "儿童" if c == "小孩" else c
+                break
+
+        # 健康标签（高蛋白/低脂/低糖/素食/无麸质）
+        health_tags = ""
+        for t in ("高蛋白", "低脂", "低糖", "素食", "无麸质"):
+            if t in text:
+                health_tags = t
+                break
+
+        # 过敏原（海鲜/花生/鸡蛋/牛奶/大豆/大蒜）
+        allergen_avoid = ""
+        for a in ("海鲜", "花生", "鸡蛋", "牛奶", "大豆", "大蒜"):
+            if f"{a}过敏" in text or f"对{a}" in text:
+                allergen_avoid = a
+                break
+
+        # 历史已推荐菜名 → exclude_dishes（换菜/追加场景排除，避免重复推荐）
+        exclude: set[str] = set()
+        for msg in history:
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                exclude.update(self._extract_dish_entries(content).keys())
+
+        kwargs: dict = {
+            "people_count": people_count,
+            "taste": taste,
+            "customer_type": customer_type,
+        }
+        if health_tags:
+            kwargs["health_tags"] = health_tags
+        if allergen_avoid:
+            kwargs["allergen_avoid"] = allergen_avoid
+        if membership_level:
+            kwargs["membership_level"] = membership_level
+        if exclude:
+            kwargs["exclude_dishes"] = ",".join(sorted(exclude))
+
+        from tools import recommend_dishes
+        logger.warning("推荐意图规则兜底: user_input=%s kwargs=%s", user_input[:40], kwargs)
+        tool_output = recommend_dishes.invoke(kwargs)
+        response = self._clean_tool_output(tool_output)
+        return response, [HumanMessage(content=user_input), AIMessage(content=response)]
 
     @classmethod
     def _extract_dish_entries(cls, text: str) -> dict[str, str]:
