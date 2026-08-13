@@ -78,6 +78,42 @@ _CHAT_INTENT_RE = re.compile(
     r"^(你好|您好|谢谢|感谢|再见|拜拜|在吗|你是谁|能做什么|营业时间|地址|电话|好的|嗯|ok)\s*[!？。，~～]*$",
     re.IGNORECASE,
 )
+
+# ======================== 中文数字转换 ========================
+# 用户输入中的人数可能是中文数字（"六个人""两个人"），需转成阿拉伯数字，
+# 否则 _fallback_recommend 会解析失败返回 0，丢失人数信息。
+_CN_DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100}
+
+
+def _chinese_to_digit(text: str) -> int:
+    """中文数字 → 阿拉伯数字。支持常见表达（六/十/十五/二十/两百）。
+
+    规则：
+      - "十/百"前置无数字时视为 1 个（"十五" = 15）
+      - 个位与单位交替累加（"二十" = 20，"二十三" = 23，"两百" = 200）
+    遇到无法解析的字符时返回 0（上层回退默认值）。
+    """
+    text = text.strip()
+    if not text:
+        return 0
+    total = 0
+    section = 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            section = section * 10 + _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if section == 0:
+                section = 1  # "十五" 中的 "十"
+            total += section * unit
+            section = 0
+        else:
+            return 0
+    return total + section
+
+
 # 推荐输出格式特征（LLM 未调用工具却出现这些 → 复述历史/编造）
 _RECOMMEND_OUTPUT_RE = re.compile(r"为您推荐|合计[:：]?\s*￥|---\s*\S+\s*---")
 
@@ -536,9 +572,14 @@ class OrderingAgent:
         """
         text = user_input or ""
 
-        # 人数
-        m = re.search(r"(\d+)\s*个?人", text)
-        people_count = int(m.group(1)) if m else 0
+        # 人数（支持中文数字："6个人" / "六个人" / "两个人"）
+        m = re.search(r"(\d+|[一二两三四五六七八九十百]+)\s*个?人", text)
+        if m:
+            num_str = m.group(1)
+            people_count = int(num_str) if num_str.isdigit() else _chinese_to_digit(num_str)
+        else:
+            # 未显式提到人数：传 0，由 recommend_dishes 按默认配额处理
+            people_count = 0
 
         # 口味
         taste = ""
