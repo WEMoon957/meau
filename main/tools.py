@@ -399,21 +399,6 @@ def generate_server_script(scene: str, script_type: str = "") -> str:
     return "\n".join(lines).strip()
 
 
-@tool
-def add_custom_script(content: str, script_type: str = "custom", dish_name: str = "", scene: str = "") -> str:
-    """添加自定义话术到话术向量库，供后续检索使用。当服务员或店长想补充新的话术时使用。
-
-    Args:
-        content: 话术内容
-        script_type: 话术类型：selling_point/scene/pairing/exception/custom，默认custom
-        dish_name: 关联的菜品名称（可选）
-        scene: 场景描述（可选）
-    """
-    from vector_store import add_script
-
-    return add_script(content, script_type, dish_name, scene)
-
-
 # 所有工具列表（供 Agent 使用）
 ALL_TOOLS = [
     query_dish,
@@ -425,5 +410,4 @@ ALL_TOOLS = [
     get_cart,
     checkout,
     generate_server_script,
-    add_custom_script,
 ]
