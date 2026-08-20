@@ -13,3 +13,5 @@ python-dotenv>=1.0.0
 # 购物车代理：RSA2 签名 + 调用收钱吧网关
 cryptography>=42.0.0
 httpx>=0.27.0
+# MCP Server（将工具封装为 MCP，供外部 agent 调用）
+mcp>=2.0.0,<3

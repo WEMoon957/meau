@@ -581,13 +581,16 @@ async def health_check():
     except Exception:
         db_ok = False
 
-    # Redis 探活（未启用视为 ok 并标记未启用）
+    # Redis 探活（未启用视为 ok 并标记未启用；启用但 ping 失败才视为 fail）
     redis_ok = True
+    redis_status = "disabled"  # 未配置 REDIS_URL（单 worker 内存模式）不算降级
     if _redis_client is not None:
         try:
             _redis_client.ping()
+            redis_status = "ok"
         except Exception:
             redis_ok = False
+            redis_status = "fail"
 
     # KB 探活：仅检测单例是否加载，不在健康检查里触发向量检索（避免拖慢探活）
     kb_ok = True
@@ -617,7 +620,7 @@ async def health_check():
             },
             "dependencies": {
                 "db": "ok" if db_ok else "fail",
-                "redis": "ok" if redis_ok else ("disabled" if _redis_client is None else "fail"),
+                "redis": redis_status,
                 "kb": "ok" if kb_ok else "unloaded",
             },
         },
@@ -681,7 +684,8 @@ async def cart_add(request: _CartAddRequest, http_request: Request):
 # ======================== 确认下单：菜名反查 id + 批量加购 ========================
 # 用户在对话中说"确认下单"后，前端先解析推荐文本里的菜名，调 /api/dish/resolve
 # 反查菜品 id（加购接口必须传 goodsId/skuId），再调 /api/cart/batch-add 一次性加入购物车。
-# 收钱吧网关目前返回 404，batch-add 在真实调用全部失败时降级为 mock 成功。
+# 加购经 MCP Server（桌面 cart_server.py，stdio）调用收钱吧网关 /api/v1（已验证可用），
+# MCP 不可用时 batch-add 降级为 mock 成功（mocked=True）。
 from cart_api import (  # noqa: E402
     BatchCartAddRequest as _BatchCartAddRequest,
     BatchCartAddResponse as _BatchCartAddResponse,
@@ -749,8 +753,9 @@ async def dish_resolve(request: DishResolveRequest, http_request: Request):
 async def cart_batch_add(request: _BatchCartAddRequest, http_request: Request):
     """批量加入购物车（确认下单流程第二步）
 
-    前端把反查到的菜品 id 组装成 items 后一次性提交。后端逐个调用收钱吧网关，
-    全部失败时降级为 mock 成功（mocked=True），保证推荐→确认→加购链路可演示。
+    前端把反查到的菜品 id 组装成 items 后一次性提交。后端经 MCP Server
+    （get_customer_token 换 token 后逐件 add_to_cart），MCP 不可用时
+    降级为 mock 成功（mocked=True），保证推荐→确认→加购链路可演示。
 
     安全：会话鉴权 require_existing=True + 购物车限流。
     """
@@ -772,6 +777,10 @@ class CartAgentChatRequest(BaseModel):
                               description="用户自然语言，如'来份菌汤生态鸡子母锅加购'")
     session_id: str = Field(..., min_length=1, max_length=64)
     session_token: str = Field(..., min_length=1, max_length=128)
+    customer_phone: str = Field(default="", max_length=20,
+                                description="会员手机号（MCP 换 token 用，空则匿名加购）")
+    customer_name: str = Field(default="", max_length=50,
+                                description="会员姓名（空则匿名加购）")
 
 
 class CartAgentChatResponse(BaseModel):
@@ -811,6 +820,8 @@ async def cart_agent_chat(request: CartAgentChatRequest, http_request: Request):
                 request.user_message.strip(),
                 session_id,
                 request.session_token,
+                request.customer_phone.strip(),
+                request.customer_name.strip(),
             )
         return {
             "code": 200,

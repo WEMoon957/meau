@@ -119,13 +119,22 @@ class CartAgent:
         # 保证菜名提取输出是合法 JSON，减少解析失败与格式污染。
         self.llm_json = self.llm.bind(response_format={"type": "json_object"})
 
-    def chat(self, user_input: str, session_id: str, session_token: str) -> tuple[str, dict]:
+    def chat(
+        self,
+        user_input: str,
+        session_id: str,
+        session_token: str,
+        customer_phone: str = "",
+        customer_name: str = "",
+    ) -> tuple[str, dict]:
         """处理加购请求：LLM 提取菜名 → 反查 id → 同步加购 → 返回 (回复文本, 加购结果)。
 
         Args:
             user_input: 用户自然语言（如"来份菌汤生态鸡子母锅加购"）
             session_id: 会话 ID（用于加购鉴权）
             session_token: 会话令牌
+            customer_phone: 会员手机号（MCP get_customer_token 换 token 用，空则匿名）
+            customer_name: 会员姓名（空则匿名）
 
         Returns:
             (reply_text, cart_result_dict)
@@ -190,6 +199,8 @@ class CartAgent:
             items=items,
             session_id=session_id,
             session_token=session_token,
+            customer_phone=customer_phone,
+            customer_name=customer_name,
         )
         try:
             cart_result = batch_add_to_cart_sync(req)
