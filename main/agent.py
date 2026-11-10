@@ -515,7 +515,11 @@ class OrderingAgent:
                 response = self._clean_tool_output(tool_output) if tool_output else ""
         else:
             # 知识库改写场景：结构化输出 {reply}
-            rewritten = self._json_rewrite(messages, _KB_REWRITE_JSON_PROMPT, KbRewriteReply)
+            # 与推荐场景一致：去掉历史消息，避免上一轮检索结果污染当前改写。
+            # 否则多轮对话中第二轮会把第一轮的答案（存在 Redis 历史里）原样
+            # "改写"回来，导致第二次回答与第一次完全一致。
+            rewrite_messages = [messages[0]] + messages[len(history) + 1:]
+            rewritten = self._json_rewrite(rewrite_messages, _KB_REWRITE_JSON_PROMPT, KbRewriteReply)
             if rewritten is not None:
                 response = rewritten.reply
             else:
